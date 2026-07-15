@@ -248,4 +248,64 @@ test("Advanced CSS Selectors", () => {
   assert.strictEqual(containsAttr.id, "container");
 });
 
+// 8. Style and computedStyle
+test("CSSOM element.style and window.getComputedStyle", () => {
+  const container = document.getElementById("container");
+  
+  // Test element.style
+  container.style.color = "red";
+  container.style.backgroundColor = "blue";
+  
+  assert.strictEqual(container.style.color, "red");
+  assert.strictEqual(container.style.backgroundColor, "blue");
+  assert.strictEqual(container.getAttribute("style"), "color: red; background-color: blue");
+  
+  // Test computed style from stylesheet
+  const styleEl = document.createElement("style");
+  styleEl.textContent = `
+    .title { color: green; font-size: 20px; }
+    h1 { color: purple; }
+  `;
+  document.head.appendChild(styleEl);
+  
+  const h1 = document.querySelector("h1");
+  const computedH1 = window.getComputedStyle(h1);
+  
+  // title class has specificity 10, h1 has specificity 1, so class overrides element rule
+  assert.strictEqual(computedH1.color, "green");
+  assert.strictEqual(computedH1.fontSize, "20px");
+  
+  // Inline style overrides stylesheet rule
+  h1.style.color = "orange";
+  const computedH1_2 = window.getComputedStyle(h1);
+  assert.strictEqual(computedH1_2.color, "orange");
+});
+
+// 9. Canvas support
+test("Canvas context and fallback support", () => {
+  const canvas = document.createElement("canvas");
+  canvas.width = 400;
+  canvas.height = 300;
+  
+  assert.strictEqual(canvas.width, 400);
+  assert.strictEqual(canvas.height, 300);
+  assert.strictEqual(canvas.getAttribute("width"), "400");
+  assert.strictEqual(canvas.getAttribute("height"), "300");
+  
+  const ctx = canvas.getContext("2d");
+  assert.ok(ctx);
+  assert.strictEqual(ctx.canvas, canvas);
+  
+  // Draw call shouldn't throw even with mock fallback
+  ctx.fillRect(0, 0, 100, 100);
+  
+  // measureText returns standard mock structure
+  const metrics = ctx.measureText("hello");
+  assert.ok(metrics);
+  assert.strictEqual(metrics.width, 30);
+  
+  const data = canvas.toDataURL();
+  assert.ok(data.startsWith("data:image/png;base64"));
+});
+
 console.log("\n✨ ALL SPECIFICATION SUITE TESTS PASSED SUCCESSFULLY! ✨");

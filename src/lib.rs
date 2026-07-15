@@ -303,7 +303,7 @@ impl RustDocument {
     match &node.data {
       NodeData::Element(elem) => {
         if let Some(ref tag) = part.tag_name {
-          if elem.tag_name != *tag {
+          if tag != "*" && elem.tag_name != *tag {
             return false;
           }
         }
@@ -608,8 +608,33 @@ impl RustDocument {
 #[napi]
 impl RustDocument {
   #[napi(constructor)]
-  pub fn new(content: String) -> Self {
-    RustDocument::new_parsed(content)
+  pub fn new(content: Option<String>) -> Self {
+    match content {
+      Some(c) => RustDocument::new_parsed(c),
+      None => {
+        let mut doc = RustDocument { nodes: Vec::new() };
+        doc.nodes.push(ArenaNode {
+          id: 0,
+          parent: None,
+          children: Vec::new(),
+          data: NodeData::Document,
+        });
+        doc
+      }
+    }
+  }
+
+  #[napi]
+  pub fn parse(&mut self, content: String) {
+    self.nodes.truncate(1);
+    self.nodes[0].children.clear();
+    
+    let html = Html::parse_document(&content);
+    let root = html.tree.root();
+    for child in root.children() {
+      let child_id = self.build_from_scraper(child, Some(0));
+      self.nodes[0].children.push(child_id);
+    }
   }
   
   #[napi]
@@ -627,6 +652,15 @@ impl RustDocument {
       }
     }
     None
+  }
+
+  #[napi]
+  pub fn matches(&self, node_id: u32, selector_str: String) -> bool {
+    if let Some(steps) = parse_selectors(&selector_str) {
+      self.match_selector(node_id, &steps)
+    } else {
+      false
+    }
   }
 
   #[napi]
@@ -980,6 +1014,19 @@ impl RustDocument {
       parent: None,
       children: Vec::new(),
       data: NodeData::Text(text),
+    };
+    self.nodes.push(node);
+    next_id
+  }
+
+  #[napi]
+  pub fn create_document_fragment(&mut self) -> u32 {
+    let next_id = self.nodes.len() as u32;
+    let node = ArenaNode {
+      id: next_id,
+      parent: None,
+      children: Vec::new(),
+      data: NodeData::Document,
     };
     self.nodes.push(node);
     next_id
