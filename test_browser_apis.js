@@ -203,6 +203,86 @@ async function runTests() {
   details.open = true;
   await togglePromise;
 
+  // 18. New DOM APIs (append, prepend, before, after, replaceWith, remove, closest, hasAttributes, parentElement, ownerDocument)
+  const div = document.createElement("div");
+  const span1 = document.createElement("span");
+  const span2 = document.createElement("span");
+  
+  // ownerDocument & parentElement
+  assert.strictEqual(div.ownerDocument, document);
+  assert.strictEqual(document.ownerDocument, null);
+  assert.strictEqual(span1.parentElement, null);
+  
+  div.appendChild(span1);
+  assert.strictEqual(span1.parentElement, div);
+  assert.strictEqual(span1.parentNode, div);
+
+  // closest
+  div.className = "outer-div";
+  span1.className = "inner-span";
+  assert.strictEqual(span1.closest(".inner-span"), span1);
+  assert.strictEqual(span1.closest(".outer-div"), div);
+  assert.strictEqual(span1.closest(".nonexistent"), null);
+
+  // hasAttributes
+  assert.strictEqual(span2.hasAttributes(), false);
+  span2.setAttribute("data-test", "val");
+  assert.strictEqual(span2.hasAttributes(), true);
+
+  // childElementCount, children, firstElementChild, lastElementChild on Element
+  assert.strictEqual(div.childElementCount, 1);
+  assert.strictEqual(div.firstElementChild, span1);
+  assert.strictEqual(div.lastElementChild, span1);
+
+  // append & prepend (with string and Element)
+  div.append("text-append", span2);
+  assert.strictEqual(div.lastElementChild, span2);
+  assert.strictEqual(div.childNodes.item(1).nodeType, 3); // text node
+  assert.strictEqual(div.childNodes.item(1).textContent, "text-append");
+
+  const spanPre = document.createElement("span");
+  div.prepend(spanPre, "text-prepend");
+  assert.strictEqual(div.firstElementChild, spanPre);
+  assert.strictEqual(div.childNodes.item(1).nodeType, 3);
+  assert.strictEqual(div.childNodes.item(1).textContent, "text-prepend");
+
+  // childElementCount on DocumentFragment
+  const frag = document.createDocumentFragment();
+  assert.strictEqual(frag.childElementCount, 0);
+  const fragChild = document.createElement("p");
+  frag.append(fragChild, "frag-text");
+  assert.strictEqual(frag.childElementCount, 1);
+  assert.strictEqual(frag.firstElementChild, fragChild);
+
+  // DocumentFragment append in appendChild
+  const containerDiv = document.createElement("div");
+  containerDiv.appendChild(frag);
+  assert.strictEqual(containerDiv.childElementCount, 1);
+  assert.strictEqual(containerDiv.firstElementChild.tagName, "P");
+  assert.strictEqual(containerDiv.childNodes.item(1).textContent, "frag-text");
+  assert.strictEqual(frag.childNodes.length, 0); // emptied
+
+  // before, after, replaceWith, remove
+  const targetNode = containerDiv.firstElementChild; // the <p>
+  const siblingBefore = document.createElement("h1");
+  const siblingAfter = document.createElement("h2");
+  
+  targetNode.before(siblingBefore, "before-text");
+  targetNode.after("after-text", siblingAfter);
+  
+  assert.strictEqual(containerDiv.firstElementChild, siblingBefore);
+  assert.strictEqual(siblingBefore.nextSibling.textContent, "before-text");
+  assert.strictEqual(targetNode.nextSibling.textContent, "after-text");
+  assert.strictEqual(siblingAfter.previousSibling.textContent, "after-text");
+
+  const replacementNode = document.createElement("section");
+  targetNode.replaceWith(replacementNode);
+  assert.strictEqual(replacementNode.parentNode, containerDiv);
+  assert.strictEqual(targetNode.parentNode, null);
+
+  replacementNode.remove();
+  assert.strictEqual(replacementNode.parentNode, null);
+
   console.log("✅ ALL BROWSER APIS TESTS PASSED!");
 }
 

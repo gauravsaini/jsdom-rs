@@ -916,6 +916,18 @@ class NodeList {
   }
 }
 
+function convertNodesToFragment(nodes, doc, win) {
+  const frag = doc.createDocumentFragment();
+  for (const item of nodes) {
+    if (item instanceof Node) {
+      frag.appendChild(item);
+    } else {
+      frag.appendChild(doc.createTextNode(String(item)));
+    }
+  }
+  return frag;
+}
+
 // 3. Node Factory with Caching (Reference Equality Support)
 function wrapNode(rustDoc, nodeId, window) {
   if (nodeId === null || nodeId === undefined) return null;
@@ -972,6 +984,11 @@ class Node extends EventTarget {
     return this.constructor.name;
   }
 
+  get ownerDocument() {
+    if (this._nodeId === 0) return null;
+    return this._window ? this._window.document : null;
+  }
+
   get baseURI() {
     return this._window ? this._window.location.href : "about:blank";
   }
@@ -1014,6 +1031,11 @@ class Node extends EventTarget {
   get parentNode() {
     const parentId = this._rustDoc.getParentNode(this._nodeId);
     return wrapNode(this._rustDoc, parentId, this._window);
+  }
+
+  get parentElement() {
+    const parent = this.parentNode;
+    return parent && parent.nodeType === 1 ? parent : null;
   }
 
   get childNodes() {
@@ -1074,6 +1096,13 @@ class Node extends EventTarget {
 
   appendChild(child) {
     if (child instanceof Node) {
+      if (child instanceof DocumentFragment) {
+        const children = Array.from(child.childNodes);
+        for (const c of children) {
+          this.appendChild(c);
+        }
+        return child;
+      }
       if (child.tagName === "STYLE") markStylesDirty(this);
       const isConnectedBefore = isAttachedToDocument(child);
       const oldParent = child.parentNode;
@@ -1110,6 +1139,13 @@ class Node extends EventTarget {
     if (refChild !== null && refChild !== undefined && !(refChild instanceof Node)) {
       throw new Error("Parameter 2 of Node.insertBefore is not of type Node.");
     }
+    if (newChild instanceof DocumentFragment) {
+      const children = Array.from(newChild.childNodes);
+      for (const c of children) {
+        this.insertBefore(c, refChild);
+      }
+      return newChild;
+    }
     if (newChild.tagName === "STYLE") markStylesDirty(this);
     const refId = refChild ? refChild._nodeId : null;
     const isConnectedBefore = isAttachedToDocument(newChild);
@@ -1132,6 +1168,19 @@ class Node extends EventTarget {
     }
     if (!(oldChild instanceof Node)) {
       throw new Error("Parameter 2 of Node.replaceChild is not of type Node.");
+    }
+    if (newChild instanceof DocumentFragment) {
+      const children = Array.from(newChild.childNodes);
+      if (children.length === 0) {
+        this.removeChild(oldChild);
+        return oldChild;
+      }
+      const refSibling = oldChild.nextSibling;
+      this.removeChild(oldChild);
+      for (const c of children) {
+        this.insertBefore(c, refSibling);
+      }
+      return oldChild;
     }
     if (newChild.tagName === "STYLE" || oldChild.tagName === "STYLE") markStylesDirty(this);
     const isConnectedNewBefore = isAttachedToDocument(newChild);
@@ -1167,6 +1216,51 @@ class Node extends EventTarget {
       curr = parent;
     }
     return curr;
+  }
+
+  remove() {
+    if (this._nodeId === 0) {
+      throw new Error("Document is not a ChildNode");
+    }
+    if (this.parentNode) {
+      this.parentNode.removeChild(this);
+    }
+  }
+
+  before(...nodes) {
+    if (this._nodeId === 0) {
+      throw new Error("Document is not a ChildNode");
+    }
+    const parent = this.parentNode;
+    if (!parent) return;
+    const doc = this._window ? this._window.document : null;
+    if (!doc) return;
+    const fragment = convertNodesToFragment(nodes, doc, this._window);
+    parent.insertBefore(fragment, this);
+  }
+
+  after(...nodes) {
+    if (this._nodeId === 0) {
+      throw new Error("Document is not a ChildNode");
+    }
+    const parent = this.parentNode;
+    if (!parent) return;
+    const doc = this._window ? this._window.document : null;
+    if (!doc) return;
+    const fragment = convertNodesToFragment(nodes, doc, this._window);
+    parent.insertBefore(fragment, this.nextSibling);
+  }
+
+  replaceWith(...nodes) {
+    if (this._nodeId === 0) {
+      throw new Error("Document is not a ChildNode");
+    }
+    const parent = this.parentNode;
+    if (!parent) return;
+    const doc = this._window ? this._window.document : null;
+    if (!doc) return;
+    const fragment = convertNodesToFragment(nodes, doc, this._window);
+    parent.replaceChild(fragment, this);
   }
 }
 
@@ -1263,6 +1357,40 @@ class DocumentFragment extends Node {
       const scripts = this.querySelectorAll("script");
       scripts.forEach(s => runScriptIfNecessary(s, this._window));
     }
+  }
+
+  get children() {
+    const ids = this._rustDoc.getChildNodes(this._nodeId);
+    const elementIds = ids.filter(id => this._rustDoc.getTagName(id) !== null);
+    return new NodeList(this._rustDoc, elementIds, this._window);
+  }
+
+  get firstElementChild() {
+    const c = this.children;
+    return c.length > 0 ? c[0] : null;
+  }
+
+  get lastElementChild() {
+    const c = this.children;
+    return c.length > 0 ? c[c.length - 1] : null;
+  }
+
+  get childElementCount() {
+    return this.children.length;
+  }
+
+  append(...nodes) {
+    const doc = this._window ? this._window.document : null;
+    if (!doc) return;
+    const fragment = convertNodesToFragment(nodes, doc, this._window);
+    this.appendChild(fragment);
+  }
+
+  prepend(...nodes) {
+    const doc = this._window ? this._window.document : null;
+    if (!doc) return;
+    const fragment = convertNodesToFragment(nodes, doc, this._window);
+    this.insertBefore(fragment, this.firstChild);
   }
 
   querySelector(selector) {
@@ -1741,6 +1869,40 @@ class Element extends Node {
 
   hasAttribute(name) {
     return this.getAttribute(name) !== null;
+  }
+
+  hasAttributes() {
+    const attrs = this._rustDoc.getAttributes(this._nodeId);
+    return attrs && Object.keys(attrs).length > 0;
+  }
+
+  closest(selector) {
+    let el = this;
+    while (el && el.nodeType === 1) {
+      if (el.matches(selector)) {
+        return el;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  append(...nodes) {
+    const doc = this._window ? this._window.document : null;
+    if (!doc) return;
+    const fragment = convertNodesToFragment(nodes, doc, this._window);
+    this.appendChild(fragment);
+  }
+
+  prepend(...nodes) {
+    const doc = this._window ? this._window.document : null;
+    if (!doc) return;
+    const fragment = convertNodesToFragment(nodes, doc, this._window);
+    this.insertBefore(fragment, this.firstChild);
+  }
+
+  get childElementCount() {
+    return this.children.length;
   }
 
   get attributes() {
@@ -2245,6 +2407,40 @@ class Document extends Node {
   constructor(rustDoc, nodeId, window) {
     super(rustDoc, nodeId, window);
     this.adoptedStyleSheets = createAdoptedStyleSheetsArray(this);
+  }
+
+  get children() {
+    const ids = this._rustDoc.getChildNodes(this._nodeId);
+    const elementIds = ids.filter(id => this._rustDoc.getTagName(id) !== null);
+    return new NodeList(this._rustDoc, elementIds, this._window);
+  }
+
+  get firstElementChild() {
+    const c = this.children;
+    return c.length > 0 ? c[0] : null;
+  }
+
+  get lastElementChild() {
+    const c = this.children;
+    return c.length > 0 ? c[c.length - 1] : null;
+  }
+
+  get childElementCount() {
+    return this.children.length;
+  }
+
+  append(...nodes) {
+    const doc = this._window ? this._window.document : null;
+    if (!doc) return;
+    const fragment = convertNodesToFragment(nodes, doc, this._window);
+    this.appendChild(fragment);
+  }
+
+  prepend(...nodes) {
+    const doc = this._window ? this._window.document : null;
+    if (!doc) return;
+    const fragment = convertNodesToFragment(nodes, doc, this._window);
+    this.insertBefore(fragment, this.firstChild);
   }
 
   get documentElement() {
