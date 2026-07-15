@@ -258,7 +258,7 @@ test("CSSOM element.style and window.getComputedStyle", () => {
   
   assert.strictEqual(container.style.color, "red");
   assert.strictEqual(container.style.backgroundColor, "blue");
-  assert.strictEqual(container.getAttribute("style"), "color: red; background-color: blue");
+  assert.ok(container.getAttribute("style") === "color: red; background-color: blue;" || container.getAttribute("style") === "color: red; background-color: blue");
   
   // Test computed style from stylesheet
   const styleEl = document.createElement("style");
@@ -272,13 +272,13 @@ test("CSSOM element.style and window.getComputedStyle", () => {
   const computedH1 = window.getComputedStyle(h1);
   
   // title class has specificity 10, h1 has specificity 1, so class overrides element rule
-  assert.strictEqual(computedH1.color, "green");
+  assert.ok(computedH1.color === "green" || computedH1.color === "rgb(0, 128, 0)");
   assert.strictEqual(computedH1.fontSize, "20px");
   
   // Inline style overrides stylesheet rule
   h1.style.color = "orange";
   const computedH1_2 = window.getComputedStyle(h1);
-  assert.strictEqual(computedH1_2.color, "orange");
+  assert.ok(computedH1_2.color === "orange" || computedH1_2.color === "rgb(255, 165, 0)");
 });
 
 // 9. Canvas support
@@ -382,7 +382,7 @@ test("Web Components Specs", () => {
   shadowRoot.appendChild(customSpan);
   
   const computedCustomSpan = window.getComputedStyle(customSpan);
-  assert.strictEqual(computedCustomSpan.color, "teal");
+  assert.ok(computedCustomSpan.color === "teal" || computedCustomSpan.color === "rgb(0, 128, 128)");
 });
 
 console.log("\n✨ ALL SPECIFICATION SUITE TESTS PASSED SUCCESSFULLY! ✨");

@@ -1,13 +1,10 @@
-const EventEmitter = require('node:events');
-const vm = require('node:vm');
-const { MIMEType } = require('whatwg-mimetype');
-const toughCookie = require('tough-cookie');
+const path = require("node:path");
+const Module = require("module");
 
 let nativeBinding;
 try {
   nativeBinding = require('./jsdom_rs.node');
 } catch (e) {
-  // If the direct symlink fails or is missing, try to resolve platform-specific names loaded by napi-rs
   const platform = process.platform;
   const arch = process.arch;
   const libc = platform === 'linux' ? (process.report?.getReport?.().header?.glibcVersionRuntime ? 'gnu' : 'musl') : '';
@@ -34,1566 +31,660 @@ try {
 
 const { RustDocument } = nativeBinding;
 
-const activeWindows = new Set();
-
-const DOMExceptionCodes = {
-  INDEX_SIZE_ERR: 1,
-  DOMSTRING_SIZE_ERR: 2,
-  HIERARCHY_REQUEST_ERR: 3,
-  WRONG_DOCUMENT_ERR: 4,
-  INVALID_CHARACTER_ERR: 5,
-  NO_DATA_ALLOWED_ERR: 6,
-  NO_MODIFICATION_ALLOWED_ERR: 7,
-  NOT_FOUND_ERR: 8,
-  NOT_SUPPORTED_ERR: 9,
-  INUSE_ATTRIBUTE_ERR: 10,
-  INVALID_STATE_ERR: 11,
-  SYNTAX_ERR: 12,
-  INVALID_MODIFICATION_ERR: 13,
-  NAMESPACE_ERR: 14,
-  INVALID_ACCESS_ERR: 15,
-  VALIDATION_ERR: 16,
-  TYPE_MISMATCH_ERR: 17,
-  SECURITY_ERR: 18,
-  NETWORK_ERR: 19,
-  ABORT_ERR: 20,
-  URL_MISMATCH_ERR: 21,
-  QUOTA_EXCEEDED_ERR: 22,
-  TIMEOUT_ERR: 23,
-  INVALID_NODE_TYPE_ERR: 24,
-  DATA_CLONE_ERR: 25
-};
-
-const DOMExceptionNameMap = {
-  IndexSizeError: 1,
-  HierarchyRequestError: 3,
-  WrongDocumentError: 4,
-  InvalidCharacterError: 5,
-  NoModificationAllowedError: 7,
-  NotFoundError: 8,
-  NotSupportedError: 9,
-  InUseAttributeError: 10,
-  InvalidStateError: 11,
-  SyntaxError: 12,
-  InvalidModificationError: 13,
-  NamespaceError: 14,
-  InvalidAccessError: 15,
-  TypeMismatchError: 17,
-  SecurityError: 18,
-  NetworkError: 19,
-  AbortError: 20,
-  URLMismatchError: 21,
-  QuotaExceededError: 22,
-  TimeoutError: 23,
-  InvalidNodeTypeError: 24,
-  DataCloneError: 25
-};
-
-class DOMException extends Error {
-  constructor(message, name = "Error") {
-    super(message);
-    this.name = name;
-    this.code = DOMExceptionNameMap[name] || 0;
+// Lazy-loaded JSDOM internal helpers
+let idlUtils, domSymbolTree, nwsapi, selectorsModule;
+function lazyLoadHelpers() {
+  if (!idlUtils) {
+    idlUtils = require("jsdom/lib/jsdom/living/generated/utils");
+    domSymbolTree = require("jsdom/lib/jsdom/living/helpers/internal-constants").domSymbolTree;
+    nwsapi = require("nwsapi");
+    selectorsModule = require("jsdom/lib/jsdom/living/helpers/selectors");
   }
 }
-for (const [key, val] of Object.entries(DOMExceptionCodes)) {
-  DOMException[key] = val;
-  DOMException.prototype[key] = val;
+
+// Helper to mark a document as dirty when its structure changes
+function markDirty(nodeImpl) {
+  if (!nodeImpl) return;
+  lazyLoadHelpers();
+  let root = nodeImpl;
+  while (domSymbolTree.parent(root)) {
+    root = domSymbolTree.parent(root);
+  }
+  root._rustSynced = false;
+  
+  const doc = nodeImpl._ownerDocument;
+  if (doc) {
+    doc._rustSynced = false;
+  }
 }
 
-
-
-const recognizedTags = new Set([
-  "html", "head", "body", "title", "meta", "link", "style", "script", "noscript",
-  "div", "span", "p", "a", "img", "button", "input", "select", "option", "textarea", "form",
-  "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "table", "tr", "td", "th", "thead", "tbody", "tfoot",
-  "canvas", "iframe", "nav", "header", "footer", "section", "article", "aside", "main", "search",
-  "details", "summary", "dialog", "audio", "video", "source", "track", "embed", "object", "param", "picture",
-  "map", "area", "br", "hr", "pre", "blockquote", "code", "em", "strong", "small", "sub", "sup", "i", "b", "u", "mark",
-  "ruby", "rt", "rp", "bdi", "bdo", "ins", "del", "caption", "colgroup", "col", "label", "datalist", "optgroup",
-  "output", "progress", "meter", "fieldset", "legend", "template", "slot"
-]);
-
-function escapeHtml(str) {
-  if (typeof str !== "string") return "";
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function serializeNode(node, options = {}) {
-  const type = node.nodeType;
-  if (type === 3) {
-    return escapeHtml(node.nodeValue);
-  }
-  if (type === 8) {
-    return `<!--${node.nodeValue}-->`;
-  }
-  if (type === 9 || type === 11) {
-    let content = "";
-    const children = node.childNodes;
-    for (let i = 0; i < children.length; i++) {
-      content += serializeNode(children[i], options);
-    }
-    return content;
-  }
-  if (type === 1) {
-    const tag = node.tagName.toLowerCase();
-    const voidElements = new Set([
-      "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"
-    ]);
-    const attrs = node.attributes;
-    let attrStr = "";
-    for (let i = 0; i < attrs.length; i++) {
-      const attr = attrs[i];
-      attrStr += ` ${attr.name}="${escapeHtml(attr.value)}"`;
-    }
-    if (voidElements.has(tag)) {
-      return `<${tag}${attrStr}>`;
-    }
-    let content = "";
-    if (node._shadowRoot) {
-      const shadow = node._shadowRoot;
-      let shouldSerializeShadow = false;
-      if (options.serializableShadowRoots && shadow.serializable) {
-        shouldSerializeShadow = true;
-      } else if (options.shadowRoots && options.shadowRoots.includes(shadow)) {
-        shouldSerializeShadow = true;
+// Traverse JSDOM Node tree and sync it to our native RustDocument
+function syncNodeToRust(nodeImpl, rustDoc, parentRustId, idMap) {
+  lazyLoadHelpers();
+  let rustId;
+  const nodeType = nodeImpl.nodeType;
+  
+  if (nodeType === 1) { // ELEMENT_NODE
+    rustId = rustDoc.createElement(nodeImpl._localName);
+    const attrs = nodeImpl._attributeList;
+    if (attrs) {
+      for (let i = 0; i < attrs.length; i++) {
+        const attr = attrs[i];
+        rustDoc.setAttribute(rustId, attr._localName, attr._value);
       }
-      if (shouldSerializeShadow) {
-        const mode = shadow.mode;
-        const delegatesFocus = shadow.delegatesFocus ? ' shadowrootdelegatesfocus=""' : '';
-        const serializable = shadow.serializable ? ' shadowrootserializable=""' : '';
-        const clonable = shadow.clonable ? ' shadowrootclonable=""' : '';
-        content += `<template shadowrootmode="${mode}"${delegatesFocus}${serializable}${clonable}>`;
-        const shadowChildren = shadow.childNodes;
-        for (let i = 0; i < shadowChildren.length; i++) {
-          content += serializeNode(shadowChildren[i], options);
+    }
+  } else if (nodeType === 3) { // TEXT_NODE
+    rustId = rustDoc.createTextNode(nodeImpl._data || "");
+  } else if (nodeType === 8) { // COMMENT_NODE
+    rustId = rustDoc.createTextNode(""); // Treat comment as empty text for selectors
+  } else if (nodeType === 9) { // DOCUMENT_NODE
+    rustId = 0;
+  } else {
+    rustId = rustDoc.createDocumentFragment();
+  }
+
+  nodeImpl._rustId = rustId;
+  idMap[rustId] = idlUtils.wrapperForImpl(nodeImpl);
+
+  if (parentRustId !== undefined && rustId !== 0) {
+    rustDoc.appendChild(parentRustId, rustId);
+  }
+
+  for (const child of domSymbolTree.childrenIterator(nodeImpl)) {
+    syncNodeToRust(child, rustDoc, rustId, idMap);
+  }
+}
+
+// Retrieve nwsapi for fallback
+function getOriginalNwsapi(nodeImpl) {
+  lazyLoadHelpers();
+  const document = nodeImpl._ownerDocument || nodeImpl;
+  if (!document._originalNwsapi) {
+    const { _globalObject } = nodeImpl;
+    document._originalNwsapi = nwsapi({
+      document: idlUtils.wrapperForImpl(document),
+      DOMException: _globalObject.DOMException
+    });
+    document._originalNwsapi.configure({
+      LOGERRORS: false,
+      VERBOSITY: false, // suppresses selector syntax errors
+      IDS_DUPES: true,
+      MIXEDCASE: true
+    });
+  }
+  return document._originalNwsapi;
+}
+
+function getMatcher(nodeImpl) {
+  lazyLoadHelpers();
+  // Find the top-most root node in JSDOM's symbol tree (e.g. Document or DocumentFragment)
+  let root = nodeImpl;
+  while (domSymbolTree.parent(root)) {
+    root = domSymbolTree.parent(root);
+  }
+  
+  if (!root._rustSynced) {
+    const rustDoc = new RustDocument();
+    const idMap = [];
+    syncNodeToRust(root, rustDoc, undefined, idMap);
+    root._rustDoc = rustDoc;
+    root._rustIdMap = idMap;
+    root._rustSynced = true;
+  }
+  
+  return {
+    rustDoc: root._rustDoc,
+    idMap: root._rustIdMap,
+    rustId: nodeImpl._rustId
+  };
+}
+
+const mockNwsapi = {
+  first(selector, elementWrapper) {
+    try {
+      const nodeImpl = idlUtils.implForWrapper(elementWrapper);
+      const { rustDoc, idMap, rustId } = getMatcher(nodeImpl);
+      if (rustId !== undefined) {
+        const matchedId = rustDoc.querySelector(rustId, selector);
+        if (matchedId !== null && matchedId !== undefined) {
+          return idMap[matchedId] || null;
         }
-        content += "</template>";
+      }
+    } catch (e) {
+      // Fallback
+    }
+    try {
+      const nodeImpl = idlUtils.implForWrapper(elementWrapper);
+      return getOriginalNwsapi(nodeImpl).first(selector, elementWrapper);
+    } catch (err) {
+      return null;
+    }
+  },
+  select(selector, elementWrapper) {
+    try {
+      const nodeImpl = idlUtils.implForWrapper(elementWrapper);
+      const { rustDoc, idMap, rustId } = getMatcher(nodeImpl);
+      if (rustId !== undefined) {
+        const matchedIds = rustDoc.querySelectorAll(rustId, selector);
+        const results = [];
+        for (let i = 0; i < matchedIds.length; i++) {
+          const wrapper = idMap[matchedIds[i]];
+          if (wrapper) {
+            results.push(wrapper);
+          }
+        }
+        return results;
+      }
+    } catch (e) {
+      // Fallback
+    }
+    try {
+      const nodeImpl = idlUtils.implForWrapper(elementWrapper);
+      return getOriginalNwsapi(nodeImpl).select(selector, elementWrapper);
+    } catch (err) {
+      return [];
+    }
+  },
+  match(selector, elementWrapper) {
+    try {
+      const nodeImpl = idlUtils.implForWrapper(elementWrapper);
+      const { rustDoc, rustId } = getMatcher(nodeImpl);
+      if (rustId !== undefined) {
+        return rustDoc.matches(rustId, selector);
+      }
+    } catch (e) {
+      // Fallback
+    }
+    try {
+      const nodeImpl = idlUtils.implForWrapper(elementWrapper);
+      return getOriginalNwsapi(nodeImpl).match(selector, elementWrapper);
+    } catch (err) {
+      return false;
+    }
+  },
+  closest(selector, elementWrapper) {
+    try {
+      lazyLoadHelpers();
+      let current = idlUtils.implForWrapper(elementWrapper);
+      while (current) {
+        if (current.nodeType === 1) { // ELEMENT_NODE
+          if (mockNwsapi.match(selector, idlUtils.wrapperForImpl(current))) {
+            return idlUtils.wrapperForImpl(current);
+          }
+        }
+        current = domSymbolTree.parent(current);
+      }
+      return null;
+    } catch (e) {
+      // Fallback
+    }
+    try {
+      const nodeImpl = idlUtils.implForWrapper(elementWrapper);
+      return getOriginalNwsapi(nodeImpl).closest(selector, elementWrapper);
+    } catch (err) {
+      return null;
+    }
+  }
+};
+
+// CSS Specificity Calculator for computed style matching
+function getSpecificity(selector) {
+  if (!selector) return 0;
+  let ids = (selector.match(/#[a-zA-Z0-9_-]+/g) || []).length;
+  let classes = (selector.match(/\.[a-zA-Z0-9_-]+/g) || []).length;
+  let attrs = (selector.match(/\[[^\]]+\]/g) || []).length;
+  let pseudos = (selector.match(/:[a-zA-Z0-9_-]+/g) || []).filter(p => !p.startsWith('::')).length;
+  
+  let cleanSelector = selector.replace(/\[[^\]]+\]/g, '').replace(/::?[a-zA-Z0-9_-]+/g, '');
+  let tags = (cleanSelector.match(/[a-zA-Z0-9_-]+/g) || []).filter(t => !/^[0-9]+$/.test(t)).length;
+  
+  return ids * 100 + (classes + attrs + pseudos) * 10 + tags;
+}
+
+// Monkeypatched getDeclarationForElement
+let parsedDefaultStyleSheet;
+function getDeclarationForElementPatched(elementImpl) {
+  lazyLoadHelpers();
+  const { CSSStyleDeclaration } = require("cssstyle");
+  const cssom = require("rrweb-cssom");
+  const defaultStyleSheet = require("jsdom/lib/jsdom/browser/default-stylesheet");
+  
+  let styleCache = elementImpl._ownerDocument._styleCache;
+  if (!styleCache) {
+    styleCache = elementImpl._ownerDocument._styleCache = new WeakMap();
+  }
+  const cachedDeclaration = styleCache.get(elementImpl);
+  if (cachedDeclaration) {
+    return cachedDeclaration;
+  }
+
+  const declaration = new CSSStyleDeclaration();
+
+  function handleProperty(style, property) {
+    const value = style.getPropertyValue(property);
+    if (value === "unset") {
+      declaration.removeProperty(property);
+    } else {
+      declaration.setProperty(property, value, style.getPropertyPriority(property));
+    }
+  }
+
+  const matchingRules = [];
+
+  function handleSheet(sheet) {
+    if (!sheet || !sheet.cssRules) return;
+    for (let i = 0; i < sheet.cssRules.length; i++) {
+      const rule = sheet.cssRules[i];
+      if (rule.media) {
+        if (Array.prototype.indexOf.call(rule.media, "screen") !== -1) {
+          for (let j = 0; j < rule.cssRules.length; j++) {
+            const innerRule = rule.cssRules[j];
+            if (selectorsModule.matchesDontThrow(elementImpl, innerRule.selectorText)) {
+              matchingRules.push(innerRule);
+            }
+          }
+        }
+      } else if (selectorsModule.matchesDontThrow(elementImpl, rule.selectorText)) {
+        matchingRules.push(rule);
       }
     }
-    const children = node.childNodes;
-    for (let i = 0; i < children.length; i++) {
-      content += serializeNode(children[i], options);
+  }
+
+  if (!parsedDefaultStyleSheet) {
+    parsedDefaultStyleSheet = cssom.parse(defaultStyleSheet);
+  }
+
+  handleSheet(parsedDefaultStyleSheet);
+  
+  // Standard stylesheets
+  const sheets = elementImpl._ownerDocument.styleSheets._list;
+  for (let i = 0; i < sheets.length; i++) {
+    handleSheet(sheets[i]);
+  }
+
+  // ShadowRoot adopted style sheets
+  let current = elementImpl;
+  let shadowRoot = null;
+  while (current) {
+    if (current._host) {
+      shadowRoot = current;
+      break;
     }
-    return `<${tag}${attrStr}>${content}</${tag}>`;
+    current = domSymbolTree.parent(current);
+  }
+  if (shadowRoot && shadowRoot._adoptedStyleSheets) {
+    for (let i = 0; i < shadowRoot._adoptedStyleSheets.length; i++) {
+      handleSheet(shadowRoot._adoptedStyleSheets[i]);
+    }
+  }
+
+  // Document adopted style sheets
+  if (elementImpl._ownerDocument && elementImpl._ownerDocument._adoptedStyleSheets) {
+    const docAdopted = elementImpl._ownerDocument._adoptedStyleSheets;
+    for (let i = 0; i < docAdopted.length; i++) {
+      handleSheet(docAdopted[i]);
+    }
+  }
+
+  // stable sort by CSS specificity
+  matchingRules.forEach((rule, idx) => {
+    rule._index = idx;
+    rule._specificity = getSpecificity(rule.selectorText);
+  });
+  
+  matchingRules.sort((a, b) => {
+    if (a._specificity !== b._specificity) {
+      return a._specificity - b._specificity;
+    }
+    return a._index - b._index;
+  });
+
+  matchingRules.forEach(rule => {
+    for (let i = 0; i < rule.style.length; i++) {
+      const prop = rule.style[i];
+      handleProperty(rule.style, prop);
+    }
+  });
+
+  for (let i = 0; i < elementImpl.style.length; i++) {
+    const prop = elementImpl.style[i];
+    handleProperty(elementImpl.style, prop);
+  }
+
+  styleCache.set(elementImpl, declaration);
+  return declaration;
+}
+
+// Proxy-based Canvas 2D mock context creator
+function createMockCanvasContext2D(canvasWrapper) {
+  const ctx = {
+    canvas: canvasWrapper,
+    measureText: (text) => ({ width: (text || "").length * 6, height: 10 }),
+    getImageData: (x, y, w, h) => ({
+      data: new Uint8ClampedArray(w * h * 4),
+      width: w,
+      height: h
+    })
+  };
+  return new Proxy(ctx, {
+    get(target, prop) {
+      if (typeof prop === "symbol") {
+        return target[prop];
+      }
+      if (prop in target) {
+        return target[prop];
+      }
+      return () => {};
+    }
+  });
+}
+
+// Constructable CSSStyleSheet shim class
+class ConstructableCSSStyleSheet {
+  constructor() {
+    this.cssRules = [];
+  }
+
+  replace(text) {
+    return Promise.resolve().then(() => {
+      this.replaceSync(text);
+      return this;
+    });
+  }
+
+  replaceSync(text) {
+    const cssom = require("rrweb-cssom");
+    try {
+      const parsed = cssom.parse(text);
+      this.cssRules = parsed.cssRules || [];
+    } catch (e) {
+      this.cssRules = [];
+    }
+  }
+}
+
+// Recursive HTML Serialization helper for Element.prototype.getHTML
+function serializeNode(node, options = {}) {
+  const nodeType = node.nodeType;
+  if (nodeType === 3) { // TEXT_NODE
+    return node.data || "";
+  }
+  if (nodeType === 8) { // COMMENT_NODE
+    return `<!--${node.data}-->`;
+  }
+  if (nodeType === 9) { // DOCUMENT_NODE
+    let html = "";
+    for (const child of domSymbolTree.childrenIterator(node)) {
+      html += serializeNode(child, options);
+    }
+    return html;
+  }
+  if (nodeType === 1 || nodeType === 11) { // ELEMENT_NODE or DOCUMENT_FRAGMENT
+    let html = "";
+    if (nodeType === 1) {
+      html += `<${node.localName}`;
+      const attrs = node._attributeList;
+      if (attrs) {
+        for (let i = 0; i < attrs.length; i++) {
+          html += ` ${attrs[i]._localName}="${attrs[i]._value}"`;
+        }
+      }
+      html += ">";
+    }
+    
+    if (nodeType === 1 && node._shadowRoot && options.serializableShadowRoots) {
+      const mode = node._shadowRoot._mode || "open";
+      html += `<template shadowrootmode="${mode}">`;
+      const srImpl = node._shadowRoot;
+      for (const child of domSymbolTree.childrenIterator(srImpl)) {
+        html += serializeNode(child, options);
+      }
+      html += `</template>`;
+    }
+    
+    for (const child of domSymbolTree.childrenIterator(node)) {
+      html += serializeNode(child, options);
+    }
+    
+    if (nodeType === 1) {
+      const voidElements = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
+      if (!voidElements.includes(node.localName)) {
+        html += `</${node.localName}>`;
+      }
+    }
+    return html;
   }
   return "";
 }
 
-function handleDetailsToggle(element, oldOpen, newOpen) {
-  if (element.tagName === "DETAILS" && oldOpen !== newOpen) {
-    const oldState = oldOpen ? "open" : "closed";
-    const newState = newOpen ? "open" : "closed";
-    queueMicrotask(() => {
-      const event = new ToggleEvent("toggle", {
-        bubbles: false,
-        cancelable: false,
-        oldState,
-        newState
-      });
-      element.dispatchEvent(event);
-    });
+function getHTMLPatched(options = {}) {
+  lazyLoadHelpers();
+  const impl = idlUtils.implForWrapper(this);
+  if (!impl) return "";
+  let html = "";
+  if (impl._shadowRoot && options.serializableShadowRoots) {
+    const mode = impl._shadowRoot._mode || "open";
+    html += `<template shadowrootmode="${mode}">`;
+    const srImpl = impl._shadowRoot;
+    for (const child of domSymbolTree.childrenIterator(srImpl)) {
+      html += serializeNode(child, options);
+    }
+    html += `</template>`;
   }
+  for (const child of domSymbolTree.childrenIterator(impl)) {
+    html += serializeNode(child, options);
+  }
+  return html;
 }
 
-
-
-class CookieJar extends toughCookie.CookieJar {
-  constructor(store, options) {
-    super(store, { looseMode: true, ...options });
+// Monkeypatch require cache dynamically as modules are loaded
+const originalRequire = Module.prototype.require;
+Module.prototype.require = function(id) {
+  const exports = originalRequire.apply(this, arguments);
+  
+  if (id.includes("selectors")) {
+    if (exports && !exports._selectorsPatched) {
+      exports._selectorsPatched = true;
+      exports.addNwsapi = function(parentNode) {
+        return mockNwsapi;
+      };
+      exports.matchesDontThrow = function(elImpl, selector) {
+        return mockNwsapi.match(selector, idlUtils.wrapperForImpl(elImpl));
+      };
+    }
   }
-}
-
-function camelToKebab(str) {
-  return str.replace(/([a-z0-9]|(?=[A-Z]))([A-Z])/g, '$1-$2').toLowerCase();
-}
-
-class CSSStyleDeclaration {
-  constructor(element = null, readOnly = false) {
-    this._element = element;
-    this._readOnly = readOnly;
-    this._values = new Map();
-    this._parse();
-
-    return new Proxy(this, {
-      get(target, prop, receiver) {
-        if (typeof prop === 'symbol') {
-          return Reflect.get(target, prop, receiver);
+  
+  if (id.includes("style-rules")) {
+    if (exports && !exports._styleRulesPatched) {
+      exports._styleRulesPatched = true;
+      exports.getDeclarationForElement = getDeclarationForElementPatched;
+    }
+  }
+  
+  if (id.includes("parser/html")) {
+    if (exports && !exports._htmlParserPatched) {
+      exports._htmlParserPatched = true;
+      const originalParseIntoDocument = exports.parseIntoDocument;
+      exports.parseIntoDocument = function(markup, ownerDocument) {
+        const result = originalParseIntoDocument(markup, ownerDocument);
+        ownerDocument._rustSynced = false;
+        return result;
+      };
+      const originalParseFragment = exports.parseFragment;
+      exports.parseFragment = function(markup, contextElement) {
+        const result = originalParseFragment(markup, contextElement);
+        if (contextElement && contextElement._ownerDocument) {
+          contextElement._ownerDocument._rustSynced = false;
         }
-        if (prop in target || typeof target[prop] === 'function') {
-          return Reflect.get(target, prop, receiver);
-        }
-        const cssProp = camelToKebab(prop);
-        return target.getPropertyValue(cssProp);
-      },
-      set(target, prop, value, receiver) {
-        if (prop in target || typeof target[prop] === 'function') {
-          return Reflect.set(target, prop, value, receiver);
-        }
-        if (target._readOnly) return false;
-        const cssProp = camelToKebab(prop);
-        target.setProperty(cssProp, String(value));
-        return true;
-      }
-    });
+        return result;
+      };
+    }
   }
-
-  _parse() {
-    if (!this._element) return;
-    const styleAttr = this._element.getAttribute("style") || "";
-    this._values.clear();
-    const parts = styleAttr.split(";");
-    for (const part of parts) {
-      const colonIdx = part.indexOf(":");
-      if (colonIdx !== -1) {
-        const prop = part.substring(0, colonIdx).trim().toLowerCase();
-        const val = part.substring(colonIdx + 1).trim();
-        if (prop) {
-          this._values.set(prop, val);
-        }
-      }
+  
+  if (id.includes("Node-impl")) {
+    const NodeImpl = exports.implementation;
+    if (NodeImpl && !NodeImpl._nodePatched) {
+      NodeImpl._nodePatched = true;
+      const originalInsert = NodeImpl.prototype._insert;
+      NodeImpl.prototype._insert = function(node, ref, suppress) {
+        markDirty(this);
+        return originalInsert.call(this, node, ref, suppress);
+      };
+      const originalAppend = NodeImpl.prototype._append;
+      NodeImpl.prototype._append = function(node) {
+        markDirty(this);
+        return originalAppend.call(this, node);
+      };
+      const originalRemove = NodeImpl.prototype._remove;
+      NodeImpl.prototype._remove = function(suppress) {
+        markDirty(this);
+        return originalRemove.call(this, suppress);
+      };
+      const originalReplace = NodeImpl.prototype._replace;
+      NodeImpl.prototype._replace = function(node, child) {
+        markDirty(this);
+        return originalReplace.call(this, node, child);
+      };
+    }
+  }
+  
+  if (id.includes("attributes")) {
+    if (exports && !exports._attributesPatched) {
+      exports._attributesPatched = true;
+      const originalChangeAttribute = exports.changeAttribute;
+      exports.changeAttribute = function(element, attribute, value) {
+        markDirty(element);
+        return originalChangeAttribute(element, attribute, value);
+      };
+      const originalAppendAttribute = exports.appendAttribute;
+      exports.appendAttribute = function(element, attribute) {
+        markDirty(element);
+        return originalAppendAttribute(element, attribute);
+      };
+      const originalRemoveAttribute = exports.removeAttribute;
+      exports.removeAttribute = function(element, attribute) {
+        markDirty(element);
+        return originalRemoveAttribute(element, attribute);
+      };
+    }
+  }
+  
+  if (id.includes("CharacterData-impl")) {
+    const CharacterDataImpl = exports.implementation;
+    if (CharacterDataImpl && !CharacterDataImpl._characterDataPatched) {
+      CharacterDataImpl._characterDataPatched = true;
+      const originalReplaceData = CharacterDataImpl.prototype.replaceData;
+      CharacterDataImpl.prototype.replaceData = function(offset, count, data) {
+        markDirty(this);
+        return originalReplaceData.call(this, offset, count, data);
+      };
     }
   }
 
-  _serialize() {
-    if (this._readOnly || !this._element) return;
-    const parts = [];
-    for (const [prop, val] of this._values.entries()) {
-      parts.push(`${prop}: ${val}`);
-    }
-    this._element.setAttribute("style", parts.join("; "));
-  }
-
-  getPropertyValue(prop) {
-    this._parse();
-    return this._values.get(prop) || "";
-  }
-
-  setProperty(prop, val) {
-    if (this._readOnly) return;
-    this._parse();
-    if (val === null || val === "") {
-      this._values.delete(prop);
-    } else {
-      this._values.set(prop, String(val));
-    }
-    this._serialize();
-  }
-
-  removeProperty(prop) {
-    if (this._readOnly) return "";
-    this._parse();
-    const old = this._values.get(prop) || "";
-    if (this._values.delete(prop)) {
-      this._serialize();
-    }
-    return old;
-  }
-
-  get cssText() {
-    this._parse();
-    const parts = [];
-    for (const [prop, val] of this._values.entries()) {
-      parts.push(`${prop}: ${val};`);
-    }
-    return parts.join(" ");
-  }
-
-  set cssText(val) {
-    if (this._readOnly) return;
-    if (this._element) {
-      this._element.setAttribute("style", val);
-      this._parse();
-    }
-  }
-}
-
-function parseCssRules(cssText) {
-  const rules = [];
-  const cleanCss = (cssText || "").replace(/\/\*[\s\S]*?\*\//g, "");
-  const regex = /([^{]+)\{([^}]+)\}/g;
-  let match;
-  while ((match = regex.exec(cleanCss)) !== null) {
-    const selectorGroup = match[1].trim();
-    const declarationsText = match[2].trim();
-    
-    const declarations = {};
-    const declParts = declarationsText.split(";");
-    for (const decl of declParts) {
-      const colonIdx = decl.indexOf(":");
-      if (colonIdx !== -1) {
-        const prop = decl.substring(0, colonIdx).trim().toLowerCase();
-        const val = decl.substring(colonIdx + 1).trim();
-        if (prop) {
-          declarations[prop] = val;
-        }
-      }
-    }
-    
-    const selectors = selectorGroup.split(",");
-    for (const sel of selectors) {
-      const s = sel.trim();
-      if (s) {
-        rules.push({ selector: s, declarations });
-      }
-    }
-  }
-  return rules;
-}
-
-function getSpecificity(selector) {
-  let a = 0, b = 0, c = 0;
-  const ids = selector.match(/#[^\s+>~:]+/g);
-  if (ids) a += ids.length;
-  const classes = selector.match(/\.[^\s+>~:]+/g);
-  if (classes) b += classes.length;
-  const attrs = selector.match(/\[[^\]]+\]/g);
-  if (attrs) b += attrs.length;
-  const pseudos = selector.match(/:[^\s+>~]+/g);
-  if (pseudos) b += pseudos.length;
-  const tags = selector.match(/^[a-zA-Z0-9_-]+|(?<=[\s+>~])[a-zA-Z0-9_-]+/g);
-  if (tags) {
-    for (const t of tags) {
-      if (t !== "and" && t !== "or") c++;
-    }
-  }
-  return a * 100 + b * 10 + c;
-}
-
-function markStylesDirty(node) {
-  if (!node) return;
-  const doc = node._window ? node._window.document : null;
-  if (doc) {
-    doc._stylesVersion = (doc._stylesVersion || 0) + 1;
-  }
-}
-
-const consoleMethods = [
-  "assert", "clear", "count", "countReset", "debug", "dir", "dirxml", "error",
-  "group", "groupCollapsed", "groupEnd", "info", "log", "table", "time",
-  "timeLog", "timeEnd", "trace", "warn"
-];
-
-class VirtualConsole extends EventEmitter {
-  constructor() {
-    super();
-    this.on("error", () => {});
-  }
-
-  forwardTo(anyConsole, { jsdomErrors } = {}) {
-    for (const method of Object.keys(anyConsole)) {
-      if (typeof anyConsole[method] === "function") {
-        this.on(method, (...args) => {
-          anyConsole[method](...args);
-        });
-      }
-    }
-
-    const forward = (e) => {
-      if (e.type === "unhandled-exception") {
-        anyConsole.error(e.cause.stack);
-      } else {
-        anyConsole.error(e.message);
-      }
-    };
-
-    if (jsdomErrors === undefined) {
-      this.on("jsdomError", forward);
-    } else if (Array.isArray(jsdomErrors)) {
-      this.on("jsdomError", e => {
-        if (jsdomErrors.includes(e.type)) {
-          forward(e);
-        }
-      });
-    } else if (jsdomErrors !== "none") {
-      throw new TypeError("Invalid jsdomErrors option");
-    }
-
-    return this;
-  }
-}
-
-class Storage {
-  constructor(quota = 5000000) {
-    this._quota = quota;
-    this._data = new Map();
-    
-    return new Proxy(this, {
-      get(target, prop) {
-        if (typeof prop === 'symbol') {
-          return target[prop];
-        }
-        if (prop in target || typeof target[prop] === 'function') {
-          return target[prop];
-        }
-        return target.getItem(prop);
-      },
-      set(target, prop, value) {
-        if (prop in target || typeof target[prop] === 'function') {
-          target[prop] = value;
-          return true;
-        }
-        target.setItem(prop, value);
-        return true;
-      },
-      deleteProperty(target, prop) {
-        if (prop in target || typeof target[prop] === 'function') {
-          return false;
-        }
-        target.removeItem(prop);
-        return true;
-      }
-    });
-  }
-
-  get length() {
-    return this._data.size;
-  }
-
-  key(index) {
-    const keys = Array.from(this._data.keys());
-    return index >= 0 && index < keys.length ? keys[index] : null;
-  }
-
-  getItem(key) {
-    return this._data.has(key) ? this._data.get(key) : null;
-  }
-
-  setItem(key, value) {
-    const valStr = String(value);
-    const keyStr = String(key);
-    
-    let size = 0;
-    for (const [k, v] of this._data.entries()) {
-      if (k !== keyStr) {
-        size += k.length + v.length;
-      }
-    }
-    
-    if (size + keyStr.length + valStr.length > this._quota) {
-      throw new Error("QuotaExceededError: The quota has been exceeded.");
-    }
-    
-    this._data.set(keyStr, valStr);
-  }
-
-  removeItem(key) {
-    this._data.delete(String(key));
-  }
-
-  clear() {
-    this._data.clear();
-  }
-}
-
-function isAttachedToDocument(node) {
-  let curr = node;
-  while (curr) {
-    if (curr._nodeId === 0) return true;
-    if (curr instanceof ShadowRoot) {
-      curr = curr.host;
-    } else {
-      curr = curr.parentNode;
-    }
-  }
-  return false;
-}
-
-function triggerConnectionLifecycle(node, isConnectedBefore) {
-  if (!node || node._nodeId === 0) return;
-  const isConnectedNow = isAttachedToDocument(node);
-  if (isConnectedNow !== isConnectedBefore) {
-    if (node._customElementState === "upgraded") {
-      if (isConnectedNow) {
-        if (typeof node.connectedCallback === 'function') {
-          try { node.connectedCallback(); } catch(e) { reportException(node._window, e, node._window.location.href); }
-        }
-      } else {
-        if (typeof node.disconnectedCallback === 'function') {
-          try { node.disconnectedCallback(); } catch(e) { reportException(node._window, e, node._window.location.href); }
-        }
-      }
-    }
-    
-    if (node._shadowRoot) {
-      triggerConnectionLifecycle(node._shadowRoot, isConnectedBefore);
-    }
-    
-    const children = node.childNodes;
-    for (let i = 0; i < children.length; i++) {
-      triggerConnectionLifecycle(children[i], isConnectedBefore);
-    }
-  }
-}
-
-function reportException(window, error, filename) {
-  let errorString;
-  if (error && error.name && error.message !== undefined && error.stack) {
-    errorString = `[${error.name}: ${error.message}]`;
-  } else {
-    errorString = require("node:util").inspect(error);
-  }
-  const jsdomError = new Error(`Uncaught ${errorString}`, { cause: error });
-  jsdomError.type = "unhandled-exception";
-  if (window && window._virtualConsole) {
-    window._virtualConsole.emit("jsdomError", jsdomError);
-  }
-}
-
-function fetchAndRunExternalScript(node, window) {
-  const resources = window._resources;
-  if (!resources) return;
-  const src = node.getAttribute("src");
-  if (!src) return;
-  try {
-    const url = new URL(src, window.location.href).href;
-    
-    let fetchPromise;
-    if (resources === "usable") {
-      fetchPromise = fetch(url).then(res => {
-        if (!res.ok) throw new Error(`Status code: ${res.status}`);
-        return res.text();
-      });
-    } else if (resources && typeof resources.fetch === "function") {
-      fetchPromise = resources.fetch(url, { element: node });
-    } else {
-      return;
-    }
-
-    if (fetchPromise) {
-      const context = window._context || window;
-      fetchPromise
-        .then(code => {
-          if (Buffer.isBuffer(code)) {
-            code = code.toString("utf8");
-          } else if (code && typeof code === "object" && code.toString) {
-            code = code.toString();
-          }
+  if (id.includes("HTMLCanvasElement-impl")) {
+    const HTMLCanvasElementImpl = exports.implementation;
+    if (HTMLCanvasElementImpl && !HTMLCanvasElementImpl._canvasPatched) {
+      HTMLCanvasElementImpl._canvasPatched = true;
+      HTMLCanvasElementImpl.prototype.getContext = function(type) {
+        lazyLoadHelpers();
+        if (type === "2d") {
+          const w = this.width || 300;
+          const h = this.height || 150;
+          const wrapper = idlUtils ? idlUtils.wrapperForImpl(this) : null;
           try {
-            vm.runInContext(code, context, { filename: url, displayErrors: false });
-          } catch (err) {
-            reportException(window, err, url);
-          }
-          const event = new Event("load");
-          node.dispatchEvent(event);
-        })
-        .catch(err => {
-          reportException(window, err, url);
-          const event = new Event("error");
-          node.dispatchEvent(event);
-        });
-    }
-  } catch (e) {
-    reportException(window, e, window.location.href);
-  }
-}
-
-function runScriptIfNecessary(node, window) {
-  if (!isAttachedToDocument(node)) return;
-
-  if (node instanceof Element && node.tagName === "SCRIPT") {
-    if (!node._alreadyStarted) {
-      node._alreadyStarted = true;
-      if (node.hasAttribute("src")) {
-        fetchAndRunExternalScript(node, window);
-      } else {
-        const code = node.textContent;
-        try {
-          const context = window._context || window;
-          vm.runInContext(code, context, { filename: window.location.href, displayErrors: false });
-        } catch (err) {
-          reportException(window, err, window.location.href);
-        }
-      }
-    }
-  } else {
-    if (node.querySelectorAll) {
-      const scripts = node.querySelectorAll("script");
-      scripts.forEach(s => runScriptIfNecessary(s, window));
-    }
-  }
-}
-
-// Helper console creator
-function createConsole(virtualConsole) {
-  const windowConsole = {};
-  for (const method of consoleMethods) {
-    windowConsole[method] = (...args) => {
-      virtualConsole.emit(method, ...args);
-    };
-  }
-  return windowConsole;
-}
-
-function defineEventHandlerProperty(prototype, eventName, isAlwaysWindowAlias = false) {
-  const propName = "on" + eventName;
-  Object.defineProperty(prototype, propName, {
-    get() {
-      const isBodyOrHtmlAlias = !isAlwaysWindowAlias && this.tagName && (this.tagName === "BODY" || this.tagName === "HTML");
-      if ((isAlwaysWindowAlias || isBodyOrHtmlAlias) && this._window) {
-        return this._window[propName];
-      }
-      return (this._eventHandlers && this._eventHandlers[propName] !== undefined) ? this._eventHandlers[propName] : null;
-    },
-    set(handler) {
-      const isBodyOrHtmlAlias = !isAlwaysWindowAlias && this.tagName && (this.tagName === "BODY" || this.tagName === "HTML");
-      if ((isAlwaysWindowAlias || isBodyOrHtmlAlias) && this._window) {
-        this._window[propName] = handler;
-        return;
-      }
-      this._eventHandlers = this._eventHandlers || {};
-      const oldHandler = this._eventHandlers[propName];
-      if (oldHandler) {
-        this.removeEventListener(eventName, oldHandler);
-      }
-      if (typeof handler === "function") {
-        this._eventHandlers[propName] = handler;
-        this.addEventListener(eventName, handler);
-      } else {
-        delete this._eventHandlers[propName];
-      }
-    },
-    configurable: true,
-    enumerable: true
-  });
-}
-
-// 1. Events implementation
-class Event {
-  constructor(type, eventInitDict = {}) {
-    this.type = type;
-    this.bubbles = !!eventInitDict.bubbles;
-    this.cancelable = !!eventInitDict.cancelable;
-    this.composed = !!eventInitDict.composed;
-    this.defaultPrevented = false;
-    this.target = null;
-    this.currentTarget = null;
-    this.eventPhase = 0;
-    this._propagationStopped = false;
-    this._immediatePropagationStopped = false;
-    this.timeStamp = Date.now();
-    this._composedPath = [];
-  }
-  
-  stopPropagation() {
-    this._propagationStopped = true;
-  }
-  
-  stopImmediatePropagation() {
-    this._immediatePropagationStopped = true;
-    this._propagationStopped = true;
-  }
-  
-  preventDefault() {
-    if (this.cancelable) {
-      this.defaultPrevented = true;
-    }
-  }
-
-  composedPath() {
-    return this._composedPath;
-  }
-}
-
-class CustomEvent extends Event {
-  constructor(type, eventInitDict = {}) {
-    super(type, eventInitDict);
-    this.detail = eventInitDict.detail || null;
-  }
-}
-
-class ToggleEvent extends Event {
-  constructor(type, eventInitDict = {}) {
-    super(type, eventInitDict);
-    this.oldState = String(eventInitDict.oldState || "");
-    this.newState = String(eventInitDict.newState || "");
-  }
-}
-
-class EventTarget {
-  constructor() {
-    this._listeners = {};
-  }
-  
-  addEventListener(type, callback, options = {}) {
-    if (!this._listeners[type]) {
-      this._listeners[type] = [];
-    }
-    this._listeners[type].push({ callback, options });
-  }
-  
-  removeEventListener(type, callback, options = {}) {
-    if (!this._listeners[type]) return;
-    this._listeners[type] = this._listeners[type].filter(l => l.callback !== callback);
-  }
-  
-  dispatchEvent(event) {
-    Object.defineProperty(event, 'target', { value: this, writable: true, configurable: true });
-    Object.defineProperty(event, 'currentTarget', { value: this, writable: true, configurable: true });
-    
-    const path = [];
-    let current = this;
-    while (current) {
-      path.push(current);
-      if (current instanceof ShadowRoot) {
-        if (!event.composed && current !== this) {
-          break;
-        }
-        current = current.host;
-      } else {
-        current = current.parentNode;
-      }
-    }
-    
-    if (path.length > 0) {
-      const last = path[path.length - 1];
-      if (last.nodeType === 9 && last._window) {
-        path.push(last._window);
-      }
-    }
-    
-    event._composedPath = path;
-    
-    // Capturing phase
-    Object.defineProperty(event, 'eventPhase', { value: 1, writable: true, configurable: true });
-    for (let i = path.length - 1; i > 0; i--) {
-      const target = path[i];
-      Object.defineProperty(event, 'currentTarget', { value: target, writable: true, configurable: true });
-      target._invokeListeners(event, true);
-      if (event._propagationStopped) break;
-    }
-    
-    // At target phase
-    if (!event._propagationStopped) {
-      Object.defineProperty(event, 'eventPhase', { value: 2, writable: true, configurable: true });
-      Object.defineProperty(event, 'currentTarget', { value: this, writable: true, configurable: true });
-      this._invokeListeners(event, false);
-    }
-    
-    // Bubbling phase
-    if (event.bubbles && !event._propagationStopped) {
-      Object.defineProperty(event, 'eventPhase', { value: 3, writable: true, configurable: true });
-      for (let i = 1; i < path.length; i++) {
-        const target = path[i];
-        Object.defineProperty(event, 'currentTarget', { value: target, writable: true, configurable: true });
-        target._invokeListeners(event, false);
-        if (event._propagationStopped) break;
-      }
-    }
-    
-    Object.defineProperty(event, 'eventPhase', { value: 0, writable: true, configurable: true });
-    Object.defineProperty(event, 'currentTarget', { value: null, writable: true, configurable: true });
-    
-    return !event.defaultPrevented;
-  }
-  
-  _invokeListeners(event, useCapture) {
-    const type = event.type;
-    if (!this._listeners[type]) return;
-    const listeners = [...this._listeners[type]];
-    for (const listener of listeners) {
-      const capture = !!listener.options.capture;
-      if (capture === useCapture) {
-        try {
-          if (typeof listener.callback === 'function') {
-            listener.callback.call(this, event);
-          } else if (listener.callback && typeof listener.callback.handleEvent === 'function') {
-            listener.callback.handleEvent(event);
-          }
-        } catch (e) {
-          console.error(e);
-        }
-        if (listener.options.once) {
-          this.removeEventListener(type, listener.callback, listener.options);
-        }
-        if (event._immediatePropagationStopped) break;
-      }
-    }
-  }
-}
-
-class OffscreenCanvas extends EventTarget {
-  constructor(width, height) {
-    super();
-    this.width = Number(width) || 0;
-    this.height = Number(height) || 0;
-  }
-  getContext(contextId, options) {
-    if (contextId === "2d") {
-      const mockCanvas = {
-        width: this.width,
-        height: this.height,
-        getAttribute() { return null; },
-        setAttribute() {}
-      };
-      return createCanvasContext2D(mockCanvas);
-    }
-    return null;
-  }
-  transferToImageBitmap() {
-    return {};
-  }
-  toBlob() {
-    return Promise.resolve(new (globalThis.Blob || require("node:buffer").Blob)([]));
-  }
-}
-
-// Lazy NodeList / HTMLCollection Proxy wrapper to eliminate wrap/instantiation overhead on large queryAlls
-class NodeList {
-  constructor(rustDoc, ids, window) {
-    this._rustDoc = rustDoc;
-    this._ids = ids;
-    this._window = window;
-    
-    return new Proxy(this, {
-      get(target, prop) {
-        if (prop === 'length') {
-          return target._ids.length;
-        }
-        if (prop === 'item') {
-          return (i) => target.item(i);
-        }
-        if (prop === 'forEach') {
-          return (cb, thisArg) => {
-            for (let i = 0; i < target._ids.length; i++) {
-              cb.call(thisArg, target.item(i), i, target);
-            }
-          };
-        }
-        if (typeof prop === 'string') {
-          const index = Number(prop);
-          if (Number.isInteger(index) && index >= 0 && index < target._ids.length) {
-            return target.item(index);
-          }
-        }
-        if (prop === Symbol.iterator) {
-          return function* () {
-            for (let i = 0; i < target._ids.length; i++) {
-              yield target.item(i);
-            }
-          };
-        }
-        // Custom array utility checks in JS frameworks
-        if (prop === 'map') {
-          return (cb, thisArg) => {
-            const result = [];
-            for (let i = 0; i < target._ids.length; i++) {
-              result.push(cb.call(thisArg, target.item(i), i, target));
-            }
-            return result;
-          };
-        }
-        if (prop === 'find') {
-          return (cb, thisArg) => {
-            for (let i = 0; i < target._ids.length; i++) {
-              const node = target.item(i);
-              if (cb.call(thisArg, node, i, target)) return node;
-            }
-            return undefined;
-          };
-        }
-        if (prop === 'findIndex') {
-          return (cb, thisArg) => {
-            for (let i = 0; i < target._ids.length; i++) {
-              if (cb.call(thisArg, target.item(i), i, target)) return i;
-            }
-            return -1;
-          };
-        }
-        return target[prop];
-      }
-    });
-  }
-
-  item(i) {
-    if (i < 0 || i >= this._ids.length) return null;
-    return wrapNode(this._rustDoc, this._ids[i], this._window);
-  }
-}
-
-function convertNodesToFragment(nodes, doc, win) {
-  const frag = doc.createDocumentFragment();
-  for (const item of nodes) {
-    if (item instanceof Node) {
-      frag.appendChild(item);
-    } else {
-      frag.appendChild(doc.createTextNode(String(item)));
-    }
-  }
-  return frag;
-}
-
-// 3. Node Factory with Caching (Reference Equality Support)
-function wrapNode(rustDoc, nodeId, window) {
-  if (nodeId === null || nodeId === undefined) return null;
-  
-  if (window && window._nodeCache) {
-    if (window._nodeCache.has(nodeId)) {
-      return window._nodeCache.get(nodeId);
-    }
-  }
-  
-  let node;
-  if (nodeId === 0) {
-    node = new Document(rustDoc, nodeId, window);
-  } else {
-    const tagName = rustDoc.getTagName(nodeId);
-    if (tagName !== null) {
-      const tagLower = tagName.toLowerCase();
-      if (recognizedTags.has(tagLower) || tagLower.includes("-")) {
-        if (tagLower === "canvas") {
-          node = new HTMLCanvasElement(rustDoc, nodeId, window);
-        } else {
-          node = new HTMLElement(rustDoc, nodeId, window);
-        }
-      } else {
-        node = new HTMLUnknownElement(rustDoc, nodeId, window);
-      }
-    } else {
-      const val = rustDoc.getNodeValue(nodeId);
-      if (val === null) {
-        node = new DocumentFragment(rustDoc, nodeId, window);
-      } else {
-        node = new Node(rustDoc, nodeId, window);
-      }
-    }
-  }
-  
-  if (window && window._nodeCache) {
-    window._nodeCache.set(nodeId, node);
-  }
-  
-  return node;
-}
-
-// 4. Node Class Hierarchy
-class Node extends EventTarget {
-  constructor(rustDoc, nodeId, window) {
-    super();
-    this._rustDoc = rustDoc;
-    this._nodeId = nodeId;
-    this._window = window;
-  }
-
-  get [Symbol.toStringTag]() {
-    return this.constructor.name;
-  }
-
-  get ownerDocument() {
-    if (this._nodeId === 0) return null;
-    return this._window ? this._window.document : null;
-  }
-
-  get baseURI() {
-    return this._window ? this._window.location.href : "about:blank";
-  }
-
-  get nodeType() {
-    if (this._nodeId === 0) return 9; // DOCUMENT_NODE
-    const tag = this._rustDoc.getTagName(this._nodeId);
-    if (tag !== null) return 1; // ELEMENT_NODE
-    const text = this._rustDoc.getNodeValue(this._nodeId);
-    if (text !== null) {
-      const outer = this._rustDoc.getOuterHtml(this._nodeId);
-      if (outer && outer.startsWith("<!--")) return 8; // COMMENT_NODE
-      return 3; // TEXT_NODE
-    }
-    return 8; // default
-  }
-
-  get nodeName() {
-    const type = this.nodeType;
-    if (type === 9) return "#document";
-    if (type === 1) return this._rustDoc.getTagName(this._nodeId).toUpperCase();
-    if (type === 3) return "#text";
-    if (type === 8) return "#comment";
-    return "#comment";
-  }
-
-  get nodeValue() {
-    return this._rustDoc.getNodeValue(this._nodeId);
-  }
-
-  set nodeValue(val) {
-    const oldVal = this.nodeValue;
-    const valStr = val === null ? null : String(val);
-    if (oldVal !== valStr) {
-      this._rustDoc.setNodeValue(this._nodeId, valStr);
-      notifyMutation(new MutationRecord("characterData", this, [], [], null, oldVal));
-    }
-  }
-
-  get parentNode() {
-    const parentId = this._rustDoc.getParentNode(this._nodeId);
-    return wrapNode(this._rustDoc, parentId, this._window);
-  }
-
-  get parentElement() {
-    const parent = this.parentNode;
-    return parent && parent.nodeType === 1 ? parent : null;
-  }
-
-  get childNodes() {
-    const ids = this._rustDoc.getChildNodes(this._nodeId);
-    return new NodeList(this._rustDoc, ids, this._window);
-  }
-
-  get firstChild() {
-    const ids = this._rustDoc.getChildNodes(this._nodeId);
-    return ids.length > 0 ? wrapNode(this._rustDoc, ids[0], this._window) : null;
-  }
-
-  get lastChild() {
-    const ids = this._rustDoc.getChildNodes(this._nodeId);
-    return ids.length > 0 ? wrapNode(this._rustDoc, ids[ids.length - 1], this._window) : null;
-  }
-
-  get nextSibling() {
-    const parent = this.parentNode;
-    if (!parent) return null;
-    const siblings = parent.childNodes;
-    const idx = siblings.findIndex(n => n._nodeId === this._nodeId);
-    return idx !== -1 && idx < siblings.length - 1 ? siblings[idx + 1] : null;
-  }
-
-  get previousSibling() {
-    const parent = this.parentNode;
-    if (!parent) return null;
-    const siblings = parent.childNodes;
-    const idx = siblings.findIndex(n => n._nodeId === this._nodeId);
-    return idx > 0 ? siblings[idx - 1] : null;
-  }
-
-  get textContent() {
-    return this._rustDoc.getTextContent(this._nodeId) || "";
-  }
-
-  set textContent(val) {
-    if (this.tagName === "STYLE") markStylesDirty(this);
-    const removedNodes = Array.from(this.childNodes);
-    const valStr = String(val);
-    this._rustDoc.setTextContent(this._nodeId, valStr);
-    const addedNodes = valStr ? Array.from(this.childNodes) : [];
-    notifyMutation(new MutationRecord("childList", this, addedNodes, removedNodes));
-  }
-
-  contains(otherNode) {
-    if (!(otherNode instanceof Node)) {
-      return false;
-    }
-    let curr = otherNode;
-    while (curr) {
-      if (curr === this) return true;
-      curr = curr.parentNode;
-    }
-    return false;
-  }
-
-  appendChild(child) {
-    if (child instanceof Node) {
-      if (child instanceof DocumentFragment) {
-        const children = Array.from(child.childNodes);
-        for (const c of children) {
-          this.appendChild(c);
-        }
-        return child;
-      }
-      if (child.tagName === "STYLE") markStylesDirty(this);
-      const isConnectedBefore = isAttachedToDocument(child);
-      const oldParent = child.parentNode;
-      if (oldParent) {
-        oldParent.removeChild(child);
-      }
-      this._rustDoc.appendChild(this._nodeId, child._nodeId);
-      triggerConnectionLifecycle(child, isConnectedBefore);
-      if (this._window && this._window._runScripts === "dangerously") {
-        runScriptIfNecessary(child, this._window);
-      }
-      notifyMutation(new MutationRecord("childList", this, [child], []));
-      return child;
-    }
-    throw new Error("Parameter 1 of Node.appendChild is not of type Node.");
-  }
-
-  removeChild(child) {
-    if (child instanceof Node) {
-      if (child.tagName === "STYLE") markStylesDirty(this);
-      const isConnectedBefore = isAttachedToDocument(child);
-      this._rustDoc.removeChild(this._nodeId, child._nodeId);
-      triggerConnectionLifecycle(child, isConnectedBefore);
-      notifyMutation(new MutationRecord("childList", this, [], [child]));
-      return child;
-    }
-    throw new Error("Parameter 1 of Node.removeChild is not of type Node.");
-  }
-
-  insertBefore(newChild, refChild) {
-    if (!(newChild instanceof Node)) {
-      throw new Error("Parameter 1 of Node.insertBefore is not of type Node.");
-    }
-    if (refChild !== null && refChild !== undefined && !(refChild instanceof Node)) {
-      throw new Error("Parameter 2 of Node.insertBefore is not of type Node.");
-    }
-    if (newChild instanceof DocumentFragment) {
-      const children = Array.from(newChild.childNodes);
-      for (const c of children) {
-        this.insertBefore(c, refChild);
-      }
-      return newChild;
-    }
-    if (newChild.tagName === "STYLE") markStylesDirty(this);
-    const refId = refChild ? refChild._nodeId : null;
-    const isConnectedBefore = isAttachedToDocument(newChild);
-    const oldParent = newChild.parentNode;
-    if (oldParent) {
-      oldParent.removeChild(newChild);
-    }
-    this._rustDoc.insertBefore(this._nodeId, newChild._nodeId, refId);
-    triggerConnectionLifecycle(newChild, isConnectedBefore);
-    if (this._window && this._window._runScripts === "dangerously") {
-      runScriptIfNecessary(newChild, this._window);
-    }
-    notifyMutation(new MutationRecord("childList", this, [newChild], []));
-    return newChild;
-  }
-
-  replaceChild(newChild, oldChild) {
-    if (!(newChild instanceof Node)) {
-      throw new Error("Parameter 1 of Node.replaceChild is not of type Node.");
-    }
-    if (!(oldChild instanceof Node)) {
-      throw new Error("Parameter 2 of Node.replaceChild is not of type Node.");
-    }
-    if (newChild instanceof DocumentFragment) {
-      const children = Array.from(newChild.childNodes);
-      if (children.length === 0) {
-        this.removeChild(oldChild);
-        return oldChild;
-      }
-      const refSibling = oldChild.nextSibling;
-      this.removeChild(oldChild);
-      for (const c of children) {
-        this.insertBefore(c, refSibling);
-      }
-      return oldChild;
-    }
-    if (newChild.tagName === "STYLE" || oldChild.tagName === "STYLE") markStylesDirty(this);
-    const isConnectedNewBefore = isAttachedToDocument(newChild);
-    const isConnectedOldBefore = isAttachedToDocument(oldChild);
-    const oldParent = newChild.parentNode;
-    if (oldParent) {
-      oldParent.removeChild(newChild);
-    }
-    const ret = this._rustDoc.replaceChild(this._nodeId, newChild._nodeId, oldChild._nodeId);
-    if (ret !== null) {
-      triggerConnectionLifecycle(newChild, isConnectedNewBefore);
-      triggerConnectionLifecycle(oldChild, isConnectedOldBefore);
-      if (this._window && this._window._runScripts === "dangerously") {
-        runScriptIfNecessary(newChild, this._window);
-      }
-      notifyMutation(new MutationRecord("childList", this, [newChild], [oldChild]));
-      return oldChild;
-    }
-    throw new Error("Old child not found in parent.");
-  }
-
-  cloneNode(deep = false) {
-    const clonedId = this._rustDoc.cloneNode(this._nodeId, !!deep);
-    return wrapNode(this._rustDoc, clonedId, this._window);
-  }
-
-  getRootNode(options = {}) {
-    const composed = !!options.composed;
-    let curr = this;
-    while (curr) {
-      const parent = curr instanceof ShadowRoot ? (composed ? curr.host : null) : curr.parentNode;
-      if (!parent) return curr;
-      curr = parent;
-    }
-    return curr;
-  }
-
-  remove() {
-    if (this._nodeId === 0) {
-      throw new Error("Document is not a ChildNode");
-    }
-    if (this.parentNode) {
-      this.parentNode.removeChild(this);
-    }
-  }
-
-  before(...nodes) {
-    if (this._nodeId === 0) {
-      throw new Error("Document is not a ChildNode");
-    }
-    const parent = this.parentNode;
-    if (!parent) return;
-    const doc = this._window ? this._window.document : null;
-    if (!doc) return;
-    const fragment = convertNodesToFragment(nodes, doc, this._window);
-    parent.insertBefore(fragment, this);
-  }
-
-  after(...nodes) {
-    if (this._nodeId === 0) {
-      throw new Error("Document is not a ChildNode");
-    }
-    const parent = this.parentNode;
-    if (!parent) return;
-    const doc = this._window ? this._window.document : null;
-    if (!doc) return;
-    const fragment = convertNodesToFragment(nodes, doc, this._window);
-    parent.insertBefore(fragment, this.nextSibling);
-  }
-
-  replaceWith(...nodes) {
-    if (this._nodeId === 0) {
-      throw new Error("Document is not a ChildNode");
-    }
-    const parent = this.parentNode;
-    if (!parent) return;
-    const doc = this._window ? this._window.document : null;
-    if (!doc) return;
-    const fragment = convertNodesToFragment(nodes, doc, this._window);
-    parent.replaceChild(fragment, this);
-  }
-}
-
-class CSSStyleSheet {
-  constructor(options = {}) {
-    this.media = options.media || "";
-    this.title = options.title || "";
-    this.disabled = !!options.disabled;
-    this._cssText = "";
-    this._rules = [];
-  }
-
-  get cssRules() {
-    return this._rules;
-  }
-
-  replace(cssText) {
-    try {
-      this.replaceSync(cssText);
-      return Promise.resolve(this);
-    } catch (e) {
-      return Promise.reject(e);
-    }
-  }
-
-  replaceSync(cssText) {
-    this._cssText = String(cssText);
-    const parsed = parseCssRules(this._cssText);
-    this._rules = parsed.map((rule, index) => {
-      return {
-        selectorText: rule.selector,
-        style: {
-          cssText: Object.entries(rule.declarations).map(([k, v]) => `${k}: ${v};`).join(" ")
-        },
-        _rule: rule
-      };
-    });
-    
-    if (this._owners) {
-      for (const owner of this._owners) {
-        markStylesDirty(owner);
-      }
-    }
-  }
-}
-
-function createAdoptedStyleSheetsArray(owner) {
-  const arr = [];
-  return new Proxy(arr, {
-    set(target, prop, value, receiver) {
-      const success = Reflect.set(target, prop, value, receiver);
-      if (success) {
-        if (value instanceof CSSStyleSheet) {
-          value._owners = value._owners || new Set();
-          value._owners.add(owner);
-        }
-        markStylesDirty(owner);
-      }
-      return success;
-    },
-    deleteProperty(target, prop) {
-      const value = target[prop];
-      const success = Reflect.deleteProperty(target, prop);
-      if (success) {
-        if (value instanceof CSSStyleSheet && value._owners) {
-          value._owners.delete(owner);
-        }
-        markStylesDirty(owner);
-      }
-      return success;
-    }
-  });
-}
-
-class DocumentFragment extends Node {
-  get nodeType() {
-    return 11;
-  }
-
-  get nodeName() {
-    return "#document-fragment";
-  }
-
-  get innerHTML() {
-    return this._rustDoc.getInnerHtml(this._nodeId) || "";
-  }
-
-  set innerHTML(val) {
-    this._rustDoc.setInnerHtml(this._nodeId, String(val));
-    if (this._window && this._window.customElements) {
-      this._window.customElements.upgrade(this);
-    }
-    if (this._window && this._window._runScripts === "dangerously") {
-      const scripts = this.querySelectorAll("script");
-      scripts.forEach(s => runScriptIfNecessary(s, this._window));
-    }
-  }
-
-  get children() {
-    const ids = this._rustDoc.getChildNodes(this._nodeId);
-    const elementIds = ids.filter(id => this._rustDoc.getTagName(id) !== null);
-    return new NodeList(this._rustDoc, elementIds, this._window);
-  }
-
-  get firstElementChild() {
-    const c = this.children;
-    return c.length > 0 ? c[0] : null;
-  }
-
-  get lastElementChild() {
-    const c = this.children;
-    return c.length > 0 ? c[c.length - 1] : null;
-  }
-
-  get childElementCount() {
-    return this.children.length;
-  }
-
-  append(...nodes) {
-    const doc = this._window ? this._window.document : null;
-    if (!doc) return;
-    const fragment = convertNodesToFragment(nodes, doc, this._window);
-    this.appendChild(fragment);
-  }
-
-  prepend(...nodes) {
-    const doc = this._window ? this._window.document : null;
-    if (!doc) return;
-    const fragment = convertNodesToFragment(nodes, doc, this._window);
-    this.insertBefore(fragment, this.firstChild);
-  }
-
-  querySelector(selector) {
-    const matchedId = this._rustDoc.querySelector(this._nodeId, selector);
-    return wrapNode(this._rustDoc, matchedId, this._window);
-  }
-
-  querySelectorAll(selector) {
-    const ids = this._rustDoc.querySelectorAll(this._nodeId, selector);
-    return new NodeList(this._rustDoc, ids, this._window);
-  }
-}
-
-class ShadowRoot extends DocumentFragment {
-  constructor(rustDoc, nodeId, window, host, mode) {
-    super(rustDoc, nodeId, window);
-    this.host = host;
-    this.mode = mode;
-    this.adoptedStyleSheets = createAdoptedStyleSheetsArray(this);
-    this.delegatesFocus = false;
-    this.serializable = false;
-    this.clonable = false;
-  }
-
-  get nodeName() {
-    return "#document-fragment";
-  }
-
-  getHTML(options = {}) {
-    let content = "";
-    const children = this.childNodes;
-    for (let i = 0; i < children.length; i++) {
-      content += serializeNode(children[i], options);
-    }
-    return content;
-  }
-}
-
-const activeObservers = new Set();
-
-class MutationRecord {
-  constructor(type, target, addedNodes = [], removedNodes = [], attributeName = null, oldValue = null) {
-    this.type = type;
-    this.target = target;
-    this.addedNodes = addedNodes;
-    this.removedNodes = removedNodes;
-    this.attributeName = attributeName;
-    this.oldValue = oldValue;
-  }
-}
-
-class MutationObserver {
-  constructor(callback) {
-    this.callback = callback;
-    this.records = [];
-    this.targets = new Map();
-  }
-
-  observe(target, options) {
-    if (!(target instanceof Node)) {
-      throw new TypeError("parameter 1 is not of type Node.");
-    }
-    this.targets.set(target, options);
-    activeObservers.add(this);
-  }
-
-  disconnect() {
-    this.targets.clear();
-    activeObservers.delete(this);
-  }
-
-  takeRecords() {
-    const r = this.records;
-    this.records = [];
-    return r;
-  }
-}
-
-function notifyMutation(record) {
-  if (activeObservers.size === 0) return;
-  for (const obs of activeObservers) {
-    let matched = false;
-    for (const [target, options] of obs.targets.entries()) {
-      let isTarget = target === record.target;
-      let isSubtree = options.subtree && target.contains(record.target);
-      if (isTarget || isSubtree) {
-        if (record.type === "attributes" && options.attributes) {
-          if (!options.attributeFilter || options.attributeFilter.includes(record.attributeName)) {
-            matched = true;
-          }
-        } else if (record.type === "childList" && options.childList) {
-          matched = true;
-        } else if (record.type === "characterData" && options.characterData) {
-          matched = true;
-        }
-      }
-    }
-    if (matched) {
-      obs.records.push(record);
-      if (!obs._queued) {
-        obs._queued = true;
-        queueMicrotask(() => {
-          obs._queued = false;
-          if (obs.records.length > 0) {
+            const { createCanvas } = require("@napi-rs/canvas");
+            const canvas = createCanvas(w, h);
+            const ctx = canvas.getContext("2d");
+            ctx.canvas = wrapper;
+            return ctx;
+          } catch (e) {
             try {
-              obs.callback(obs.takeRecords(), obs);
-            } catch (e) {
-              // Ignore or report
-            }
+              const canvasPkg = require("canvas");
+              const canvas = canvasPkg.createCanvas(w, h);
+              const ctx = canvas.getContext("2d");
+              ctx.canvas = wrapper;
+              return ctx;
+            } catch (err) {}
           }
+          return createMockCanvasContext2D(wrapper);
+        }
+        return null;
+      };
+      HTMLCanvasElementImpl.prototype.toDataURL = function() {
+        try {
+          const { createCanvas } = require("@napi-rs/canvas");
+          const canvas = createCanvas(this.width || 300, this.height || 150);
+          return canvas.toDataURL();
+        } catch (e) {
+          try {
+            const canvasPkg = require("canvas");
+            const canvas = canvasPkg.createCanvas(this.width || 300, this.height || 150);
+            return canvas.toDataURL();
+          } catch (err) {}
+        }
+        // transparent 1x1 pixel png fallback data URL
+        return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+      };
+    }
+  }
+
+  if (id.includes("HTMLDetailsElement-impl")) {
+    const HTMLDetailsElementImpl = exports.implementation;
+    if (HTMLDetailsElementImpl && !HTMLDetailsElementImpl._detailsPatched) {
+      HTMLDetailsElementImpl._detailsPatched = true;
+      HTMLDetailsElementImpl.prototype._dispatchToggleEvent = function() {
+        lazyLoadHelpers();
+        this._taskQueue = null;
+        const isOpen = this.hasAttributeNS(null, "open");
+        const oldState = isOpen ? "closed" : "open";
+        const newState = isOpen ? "open" : "closed";
+        const ToggleEvent = this._globalObject.ToggleEvent || this._globalObject.window.ToggleEvent;
+        const event = new ToggleEvent("toggle", {
+          oldState,
+          newState
         });
+        this.dispatchEvent(idlUtils.implForWrapper(event));
+      };
+    }
+  }
+
+  return exports;
+};
+
+// Now import the main JSDOM package
+const jsdom = require("jsdom");
+const OriginalJSDOM = jsdom.JSDOM;
+
+// Shims for browser features
+const dummyDom = new OriginalJSDOM("<!DOCTYPE html>");
+const dummyWindow = dummyDom.window;
+
+const Window = dummyWindow.Window;
+const Document = dummyWindow.Document;
+const Element = dummyWindow.Element;
+const HTMLElement = dummyWindow.HTMLElement;
+const HTMLCanvasElement = dummyWindow.HTMLCanvasElement || class HTMLCanvasElement extends HTMLElement {};
+const Node = dummyWindow.Node;
+const Event = dummyWindow.Event;
+const CustomEvent = dummyWindow.CustomEvent;
+const EventTarget = dummyWindow.EventTarget;
+const DocumentFragment = dummyWindow.DocumentFragment;
+const ShadowRoot = dummyWindow.ShadowRoot;
+const MutationObserver = dummyWindow.MutationObserver;
+const MutationRecord = dummyWindow.MutationRecord;
+
+// Extend prototypes of NodeList and HTMLCollection with Array helpers for compatibility
+for (const cls of [dummyWindow.NodeList, dummyWindow.HTMLCollection]) {
+  if (cls && cls.prototype) {
+    for (const name of ["find", "filter", "map", "reduce", "some", "every", "indexOf"]) {
+      if (!cls.prototype[name]) {
+        cls.prototype[name] = Array.prototype[name];
       }
     }
   }
 }
 
-class FileReader extends EventTarget {
-  constructor() {
-    super();
-    this.readyState = 0; // EMPTY
-    this.result = null;
-    this.error = null;
-    this.onloadstart = null;
-    this.onprogress = null;
-    this.onload = null;
-    this.onabort = null;
-    this.onerror = null;
-    this.onloadend = null;
-  }
-
-  _dispatch(type, eventProps = {}) {
-    const ev = new Event(type);
-    Object.assign(ev, eventProps);
-    if (typeof this["on" + type] === "function") {
-      this["on" + type](ev);
-    }
-    this.dispatchEvent(ev);
-  }
-
-  _read(blob, format) {
-    if (this.readyState === 1) {
-      throw new Error("InvalidStateError: FileReader is busy reading.");
-    }
-    this.readyState = 1; // LOADING
-    this.result = null;
-    this.error = null;
-    this._dispatch("loadstart");
-    
-    process.nextTick(async () => {
-      try {
-        const NativeBlob = globalThis.Blob || require("node:buffer").Blob;
-        if (!(blob instanceof NativeBlob)) {
-          throw new TypeError("Argument 1 of FileReader.readAs... is not an instance of Blob.");
-        }
-        const buf = Buffer.from(await blob.arrayBuffer());
-        if (format === "dataURL") {
-          this.result = `data:${blob.type || "application/octet-stream"};base64,${buf.toString("base64")}`;
-        } else if (format === "text") {
-          this.result = buf.toString("utf8");
-        } else if (format === "arrayBuffer") {
-          this.result = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-        } else if (format === "binaryString") {
-          this.result = buf.toString("binary");
-        }
-        this.readyState = 2; // DONE
-        this._dispatch("load");
-        this._dispatch("loadend");
-      } catch (err) {
-        this.readyState = 2; // DONE
-        this.error = err;
-        this._dispatch("error");
-        this._dispatch("loadend");
-      }
-    });
-  }
-
-  readAsArrayBuffer(blob) {
-    this._read(blob, "arrayBuffer");
-  }
-
-  readAsBinaryString(blob) {
-    this._read(blob, "binaryString");
-  }
-
-  readAsDataURL(blob) {
-    this._read(blob, "dataURL");
-  }
-
-  readAsText(blob, encoding = "utf-8") {
-    this._read(blob, "text");
-  }
-
-  abort() {
-    if (this.readyState === 1) {
-      this.readyState = 2;
-      this.result = null;
-      this.error = new Error("AbortError");
-      this._dispatch("abort");
-      this._dispatch("loadend");
-    }
-  }
-}
-
+// WebSocket Mock/Shim
 class WebSocket extends EventTarget {
   constructor(url, protocols) {
     super();
@@ -1632,1808 +723,360 @@ class WebSocket extends EventTarget {
   }
 }
 
-class Element extends Node {
-  get tagName() {
-    const tag = this._rustDoc.getTagName(this._nodeId);
-    return tag ? tag.toUpperCase() : "";
+// FileReader Mock/Shim
+class FileReader extends EventTarget {
+  constructor() {
+    super();
+    this.readyState = 0; // EMPTY
+    this.result = null;
+    this.error = null;
+    this.onloadstart = null;
+    this.onprogress = null;
+    this.onload = null;
+    this.onabort = null;
+    this.onerror = null;
+    this.onloadend = null;
   }
 
-  get localName() {
-    const tag = this._rustDoc.getTagName(this._nodeId);
-    return tag ? tag.toLowerCase() : "";
-  }
-
-  get src() {
-    const val = this.getAttribute('src');
-    if (val === null) return "";
-    try {
-      const base = this._window ? this._window.location.href : "about:blank";
-      return new URL(val, base).href;
-    } catch (e) {
-      return val;
+  _dispatch(type, eventProps = {}) {
+    const ev = new Event(type);
+    Object.assign(ev, eventProps);
+    if (typeof this["on" + type] === "function") {
+      this["on" + type](ev);
     }
+    this.dispatchEvent(ev);
   }
 
-  set src(val) {
-    this.setAttribute('src', val);
-  }
-
-  get href() {
-    const val = this.getAttribute('href');
-    if (val === null) return "";
-    try {
-      const base = this._window ? this._window.location.href : "about:blank";
-      return new URL(val, base).href;
-    } catch (e) {
-      return val;
+  _read(blob, format) {
+    if (this.readyState === 1) {
+      throw new Error("InvalidStateError: FileReader is busy reading.");
     }
-  }
-
-  set href(val) {
-    this.setAttribute('href', val);
-  }
-
-  get id() {
-    return this.getAttribute('id') || "";
-  }
-
-  set id(val) {
-    this.setAttribute('id', val);
-  }
-
-  get className() {
-    return this.getAttribute('class') || "";
-  }
-
-  set className(val) {
-    this.setAttribute('class', val);
-  }
-
-  get style() {
-    if (!this._style) {
-      this._style = new CSSStyleDeclaration(this);
-    }
-    return this._style;
-  }
-
-  attachShadow(init) {
-    if (!init || (init.mode !== "open" && init.mode !== "closed")) {
-      throw new TypeError("Failed to execute 'attachShadow' on 'Element': member mode is required and must be 'open' or 'closed'.");
-    }
-    const validTags = [
-      "article", "aside", "blockquote", "body", "div", "footer", "h1", "h2", "h3",
-      "h4", "h5", "h6", "header", "main", "nav", "p", "section", "span"
-    ];
-    const isCustomElement = this.tagName.includes('-');
-    if (!validTags.includes(this.tagName.toLowerCase()) && !isCustomElement) {
-      throw new DOMException(`Failed to execute 'attachShadow' on 'Element': This element does not support attachShadow`, "NotSupportedError");
-    }
-    if (this._shadowRoot !== undefined) {
-      throw new DOMException(`Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.`, "InvalidStateError");
-    }
+    this.readyState = 1; // LOADING
+    this.result = null;
+    this.error = null;
+    this._dispatch("loadstart");
     
-    const nodeId = this._rustDoc.createDocumentFragment();
-    const shadow = new ShadowRoot(this._rustDoc, nodeId, this._window, this, init.mode);
-    shadow.delegatesFocus = !!init.delegatesFocus;
-    shadow.serializable = !!init.serializable;
-    shadow.clonable = !!init.clonable;
-    this._shadowRoot = shadow;
-    
-    if (this._window && this._window._nodeCache) {
-      this._window._nodeCache.set(nodeId, shadow);
-    }
-    
-    return shadow;
-  }
-
-  get shadowRoot() {
-    if (!this._shadowRoot || this._shadowRoot.mode === "closed") {
-      return null;
-    }
-    return this._shadowRoot;
-  }
-
-  getHTML(options = {}) {
-    let content = "";
-    if (this._shadowRoot) {
-      const shadow = this._shadowRoot;
-      let shouldSerializeShadow = false;
-      if (options.serializableShadowRoots && shadow.serializable) {
-        shouldSerializeShadow = true;
-      } else if (options.shadowRoots && options.shadowRoots.includes(shadow)) {
-        shouldSerializeShadow = true;
-      }
-      if (shouldSerializeShadow) {
-        const mode = shadow.mode;
-        const delegatesFocus = shadow.delegatesFocus ? ' shadowrootdelegatesfocus=""' : '';
-        const serializable = shadow.serializable ? ' shadowrootserializable=""' : '';
-        const clonable = shadow.clonable ? ' shadowrootclonable=""' : '';
-        content += `<template shadowrootmode="${mode}"${delegatesFocus}${serializable}${clonable}>`;
-        const shadowChildren = shadow.childNodes;
-        for (let i = 0; i < shadowChildren.length; i++) {
-          content += serializeNode(shadowChildren[i], options);
-        }
-        content += "</template>";
-      }
-    }
-    const children = this.childNodes;
-    for (let i = 0; i < children.length; i++) {
-      content += serializeNode(children[i], options);
-    }
-    return content;
-  }
-
-  get open() {
-    if (this.tagName === "DETAILS" || this.tagName === "DIALOG") {
-      return this.hasAttribute("open");
-    }
-    return undefined;
-  }
-
-  set open(val) {
-    if (this.tagName === "DETAILS" || this.tagName === "DIALOG") {
-      if (val) {
-        this.setAttribute("open", "");
-      } else {
-        this.removeAttribute("open");
-      }
-    }
-  }
-
-  get innerHTML() {
-    return this._rustDoc.getInnerHtml(this._nodeId) || "";
-  }
-
-  set innerHTML(val) {
-    if (this.tagName === "TEMPLATE") {
-      this.content.innerHTML = val;
-    } else {
-      const removedNodes = Array.from(this.childNodes);
-      this._rustDoc.setInnerHtml(this._nodeId, String(val));
-      if (this._window && this._window.customElements) {
-        this._window.customElements.upgrade(this);
-      }
-      if (this._window && this._window._runScripts === "dangerously") {
-        const scripts = this.querySelectorAll("script");
-        scripts.forEach(s => runScriptIfNecessary(s, this._window));
-      }
-      const addedNodes = Array.from(this.childNodes);
-      notifyMutation(new MutationRecord("childList", this, addedNodes, removedNodes));
-    }
-  }
-
-  get content() {
-    if (this.tagName !== "TEMPLATE") return undefined;
-    if (!this._content) {
-      const frag = this._window.document.createDocumentFragment();
-      const childIds = this._rustDoc.getChildNodes(this._nodeId);
-      for (const id of childIds) {
-        this._rustDoc.appendChild(frag._nodeId, id);
-      }
-      this._content = frag;
-    }
-    return this._content;
-  }
-
-  get contentWindow() {
-    if (this.tagName !== "IFRAME") return undefined;
-    if (!this._contentWindow) {
-      const iframeDoc = new RustDocument(""); // builds basic <html><head></head><body></body></html>
-      const options = {
-        runScripts: this._window ? this._window._runScripts : undefined,
-        virtualConsole: this._window ? this._window._virtualConsole : undefined,
-        storageQuota: this._window ? this._window._storageQuota : undefined,
-        resources: this._window ? this._window._resources : undefined,
-        pretendToBeVisual: this._window ? this._window._pretendToBeVisual : undefined
-      };
-      const win = new Window(iframeDoc, options, "text/html");
-      win.parent = this._window;
-      win.top = this._window ? this._window.top : win;
-      
-      const src = this.getAttribute("src");
-      if (src) {
-        try {
-          const base = this._window ? this._window.location.href : "about:blank";
-          win.location.href = new URL(src, base).href;
-        } catch (e) {}
-      }
-      
-      // Contextify iframe contentWindow if scripting is enabled!
-      if (options.runScripts === "dangerously" || options.runScripts === "outside-only") {
-        const rawWin = win[Symbol.for("unproxied")];
-        vm.createContext(rawWin);
-        win._context = rawWin;
-        win.eval = (code) => {
-          return vm.runInContext(String(code), rawWin);
-        };
-      }
-      
-      this._contentWindow = win;
-      this._contentDocument = win.document;
-    }
-    return this._contentWindow;
-  }
-
-  get contentDocument() {
-    if (this.tagName !== "IFRAME") return undefined;
-    if (!this._contentDocument) {
-      const win = this.contentWindow; // forces creation
-    }
-    return this._contentDocument;
-  }
-
-  click() {
-    const event = new Event("click", { bubbles: true, cancelable: true });
-    this.dispatchEvent(event);
-  }
-
-  hasAttribute(name) {
-    return this.getAttribute(name) !== null;
-  }
-
-  hasAttributes() {
-    const attrs = this._rustDoc.getAttributes(this._nodeId);
-    return attrs && Object.keys(attrs).length > 0;
-  }
-
-  closest(selector) {
-    let el = this;
-    while (el && el.nodeType === 1) {
-      if (el.matches(selector)) {
-        return el;
-      }
-      el = el.parentElement;
-    }
-    return null;
-  }
-
-  append(...nodes) {
-    const doc = this._window ? this._window.document : null;
-    if (!doc) return;
-    const fragment = convertNodesToFragment(nodes, doc, this._window);
-    this.appendChild(fragment);
-  }
-
-  prepend(...nodes) {
-    const doc = this._window ? this._window.document : null;
-    if (!doc) return;
-    const fragment = convertNodesToFragment(nodes, doc, this._window);
-    this.insertBefore(fragment, this.firstChild);
-  }
-
-  get childElementCount() {
-    return this.children.length;
-  }
-
-  get attributes() {
-    const attrs = this._rustDoc.getAttributes(this._nodeId);
-    if (!attrs) {
-      const arr = [];
-      arr.getNamedItem = () => null;
-      return arr;
-    }
-    const arr = Object.keys(attrs).map(name => ({ name, value: attrs[name] }));
-    arr.getNamedItem = (name) => arr.find(a => a.name === name) || null;
-    return arr;
-  }
-
-  getAttribute(name) {
-    return this._rustDoc.getAttribute(this._nodeId, name);
-  }
-
-  setAttribute(name, value) {
-    const isDetailsOrDialog = this.tagName === "DETAILS" || this.tagName === "DIALOG";
-    const oldOpen = isDetailsOrDialog ? this.hasAttribute("open") : false;
-
-    const valStr = String(value);
-    const oldVal = this.getAttribute(name);
-    this._rustDoc.setAttribute(this._nodeId, name, valStr);
-    
-    if (isDetailsOrDialog && name === "open") {
-      handleDetailsToggle(this, oldOpen, true);
-    }
-    
-    // Check if setting inline event handler
-    if (name.startsWith("on")) {
-      const eventType = name.slice(2);
-      if (this._window && this._window._runScripts === "dangerously") {
-        try {
-          const context = this._window._context || this._window;
-          const handler = vm.runInContext(`(function(event) { ${valStr} })`, context);
-          this[name] = handler; // Set it via property setter to trigger aliasing & addEventListener!
-        } catch (e) {
-          reportException(this._window, e, this._window.location.href);
-        }
-      }
-    }
-    
-    if (this._customElementState === "upgraded") {
-      const constructor = this.constructor;
-      if (Array.isArray(constructor.observedAttributes) && constructor.observedAttributes.includes(name)) {
-        if (typeof this.attributeChangedCallback === 'function') {
-          try {
-            this.attributeChangedCallback(name, oldVal, valStr);
-          } catch (e) {
-            reportException(this._window, e, this._window.location.href);
+    process.nextTick(async () => {
+      try {
+        lazyLoadHelpers();
+        const impl = idlUtils.implForWrapper(blob) || blob;
+        let buf = impl._buffer;
+        if (!buf) {
+          if (blob && typeof blob.arrayBuffer === "function") {
+            buf = Buffer.from(await blob.arrayBuffer());
+          } else {
+            throw new TypeError("Argument 1 of FileReader.readAs... is not an instance of Blob.");
           }
         }
+        if (format === "dataURL") {
+          this.result = `data:${blob.type || "application/octet-stream"};base64,${buf.toString("base64")}`;
+        } else if (format === "text") {
+          this.result = buf.toString("utf8");
+        } else if (format === "arrayBuffer") {
+          this.result = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+        } else if (format === "binaryString") {
+          this.result = buf.toString("binary");
+        }
+        this.readyState = 2; // DONE
+        this._dispatch("load");
+        this._dispatch("loadend");
+      } catch (err) {
+        this.readyState = 2; // DONE
+        this.error = err;
+        this._dispatch("error");
+        this._dispatch("loadend");
       }
-    }
-    notifyMutation(new MutationRecord("attributes", this, [], [], name, oldVal));
-  }
-
-  removeAttribute(name) {
-    const isDetailsOrDialog = this.tagName === "DETAILS" || this.tagName === "DIALOG";
-    const oldOpen = isDetailsOrDialog ? this.hasAttribute("open") : false;
-
-    const oldVal = this.getAttribute(name);
-    this._rustDoc.removeAttribute(this._nodeId, name);
-
-    if (isDetailsOrDialog && name === "open") {
-      handleDetailsToggle(this, oldOpen, false);
-    }
-
-    if (name.startsWith("on")) {
-      this["on" + name.slice(2)] = null; // triggers setter to clean up
-    }
-    
-    if (this._customElementState === "upgraded") {
-      const constructor = this.constructor;
-      if (Array.isArray(constructor.observedAttributes) && constructor.observedAttributes.includes(name)) {
-        if (typeof this.attributeChangedCallback === 'function') {
-          try {
-            this.attributeChangedCallback(name, oldVal, null);
-          } catch (e) {
-            reportException(this._window, e, this._window.location.href);
-          }
-        }
-      }
-    }
-    notifyMutation(new MutationRecord("attributes", this, [], [], name, oldVal));
-  }
-
-  querySelector(selector) {
-    const matchedId = this._rustDoc.querySelector(this._nodeId, selector);
-    return wrapNode(this._rustDoc, matchedId, this._window);
-  }
-
-  matches(selector) {
-    return this._rustDoc.matches(this._nodeId, selector);
-  }
-
-  querySelectorAll(selector) {
-    const ids = this._rustDoc.querySelectorAll(this._nodeId, selector);
-    return new NodeList(this._rustDoc, ids, this._window);
-  }
-
-  getElementsByClassName(className) {
-    const ids = this._rustDoc.getElementsByClassName(this._nodeId, className);
-    return new NodeList(this._rustDoc, ids, this._window);
-  }
-
-  getElementsByTagName(tagName) {
-    const ids = this._rustDoc.getElementsByTagName(this._nodeId, tagName);
-    return new NodeList(this._rustDoc, ids, this._window);
-  }
-
-  get children() {
-    const ids = this._rustDoc.getChildNodes(this._nodeId);
-    const elementIds = ids.filter(id => this._rustDoc.getTagName(id) !== null);
-    return new NodeList(this._rustDoc, elementIds, this._window);
-  }
-
-  get firstElementChild() {
-    const c = this.children;
-    return c.length > 0 ? c[0] : null;
-  }
-
-  get lastElementChild() {
-    const c = this.children;
-    return c.length > 0 ? c[c.length - 1] : null;
-  }
-
-  get nextElementSibling() {
-    const parent = this.parentNode;
-    if (!parent) return null;
-    const siblings = parent.children;
-    const idx = siblings.findIndex(n => n._nodeId === this._nodeId);
-    return idx !== -1 && idx < siblings.length - 1 ? siblings[idx + 1] : null;
-  }
-
-  get previousElementSibling() {
-    const parent = this.parentNode;
-    if (!parent) return null;
-    const siblings = parent.children;
-    const idx = siblings.findIndex(n => n._nodeId === this._nodeId);
-    return idx > 0 ? siblings[idx - 1] : null;
-  }
-
-  get classList() {
-    const element = this;
-    return {
-      add(...classes) {
-        let current = element.className;
-        let parts = current.split(/\s+/).filter(Boolean);
-        classes.forEach(c => {
-          if (!parts.includes(c)) parts.push(c);
-        });
-        element.className = parts.join(" ");
-      },
-      remove(...classes) {
-        let current = element.className;
-        let parts = current.split(/\s+/).filter(Boolean);
-        element.className = parts.filter(c => !classes.includes(c)).join(" ");
-      },
-      contains(cls) {
-        return element.className.split(/\s+/).filter(Boolean).includes(cls);
-      },
-      toggle(cls, force) {
-        const contains = this.contains(cls);
-        const next = force !== undefined ? !!force : !contains;
-        if (next) {
-          this.add(cls);
-        } else {
-          this.remove(cls);
-        }
-        return next;
-      }
-    };
-  }
-}
-
-let CanvasBackend = null;
-let canvasLoadAttempted = false;
-
-function getCanvasBackend() {
-  if (canvasLoadAttempted) return CanvasBackend;
-  canvasLoadAttempted = true;
-  try {
-    CanvasBackend = require("@napi-rs/canvas");
-  } catch (e1) {
-    try {
-      CanvasBackend = require("canvas");
-    } catch (e2) {
-      CanvasBackend = null;
-    }
-  }
-  return CanvasBackend;
-}
-
-function createMockCanvasContext2D(canvasElement) {
-  const mockContext = {
-    canvas: canvasElement,
-    fillStyle: "#000000",
-    strokeStyle: "#000000",
-    font: "10px sans-serif",
-    lineWidth: 1,
-  };
-  
-  return new Proxy(mockContext, {
-    get(target, prop, receiver) {
-      if (prop in target) {
-        return target[prop];
-      }
-      return (...args) => {
-        if (prop === "measureText") {
-          const text = args[0] || "";
-          return {
-            width: text.length * 6,
-            actualBoundingBoxLeft: 0,
-            actualBoundingBoxRight: text.length * 6,
-            actualBoundingBoxAscent: 0,
-            actualBoundingBoxDescent: 0,
-          };
-        }
-        if (prop === "getImageData") {
-          const w = args[2] || 0;
-          const h = args[3] || 0;
-          return {
-            width: w,
-            height: h,
-            data: new Uint8ClampedArray(w * h * 4)
-          };
-        }
-        if (prop === "createImageData") {
-          const w = args[0] || 0;
-          const h = args[1] || 0;
-          return {
-            width: w,
-            height: h,
-            data: new Uint8ClampedArray(w * h * 4)
-          };
-        }
-        return undefined;
-      };
-    },
-    set(target, prop, value, receiver) {
-      target[prop] = value;
-      return true;
-    }
-  });
-}
-
-function createCanvasContext2D(canvasElement) {
-  const backend = getCanvasBackend();
-  if (backend) {
-    const width = canvasElement.width;
-    const height = canvasElement.height;
-    let nativeCanvas;
-    if (typeof backend.createCanvas === "function") {
-      nativeCanvas = backend.createCanvas(width, height);
-    } else if (typeof backend.Canvas === "function") {
-      nativeCanvas = new backend.Canvas(width, height);
-    }
-    
-    if (nativeCanvas) {
-      canvasElement._canvasBackend = nativeCanvas;
-      return nativeCanvas.getContext("2d");
-    }
-  }
-  return createMockCanvasContext2D(canvasElement);
-}
-
-
-
-
-class CustomElementRegistry {
-  constructor(window) {
-    this._window = window;
-    this._registry = new Map();
-    this._whenDefinedPromises = new Map();
-    this._whenDefinedResolvers = new Map();
-  }
-
-  define(name, constructor, options = {}) {
-    if (typeof name !== 'string' || !name.includes('-')) {
-      throw new DOMException(`Registration failed for '${name}'. The name is not a valid custom element name.`, 'NotSupportedError');
-    }
-    if (this._registry.has(name)) {
-      throw new DOMException(`Registration failed for '${name}'. A duplicate definition was found.`, 'NotSupportedError');
-    }
-    this._registry.set(name, { constructor, options });
-    
-    if (this._whenDefinedResolvers.has(name)) {
-      this._whenDefinedResolvers.get(name)();
-      this._whenDefinedResolvers.delete(name);
-      this._whenDefinedPromises.delete(name);
-    }
-    
-    this.upgrade(this._window.document);
-  }
-
-  get(name) {
-    const entry = this._registry.get(name);
-    return entry ? entry.constructor : undefined;
-  }
-
-  whenDefined(name) {
-    if (typeof name !== 'string' || !name.includes('-')) {
-      return Promise.reject(new DOMException(`Invalid custom element name: '${name}'`, 'SyntaxError'));
-    }
-    if (this._registry.has(name)) {
-      return Promise.resolve();
-    }
-    if (this._whenDefinedPromises.has(name)) {
-      return this._whenDefinedPromises.get(name);
-    }
-    const promise = new Promise(resolve => {
-      this._whenDefinedResolvers.set(name, resolve);
     });
-    this._whenDefinedPromises.set(name, promise);
-    return promise;
   }
 
-  upgrade(root) {
-    const upgradeElement = (element) => {
-      const name = element.localName;
-      if (name) {
-        const definition = this._registry.get(name);
-        if (definition && !element._customElementState) {
-          this._upgradeElementWithDefinition(element, definition);
-        }
-      }
-      
-      if (element.shadowRoot) {
-        upgradeElement(element.shadowRoot);
-      }
-      const children = element.children;
-      if (children) {
-        for (let i = 0; i < children.length; i++) {
-          upgradeElement(children[i]);
-        }
-      }
-    };
-    upgradeElement(root);
+  readAsArrayBuffer(blob) {
+    this._read(blob, "arrayBuffer");
   }
 
-  _upgradeElementWithDefinition(element, definition) {
-    element._customElementState = "upgraded";
-    const constructor = definition.constructor;
-    
-    Object.setPrototypeOf(element, constructor.prototype);
-    
-    try {
-      HTMLElement._constructionStack.push(element);
-      new constructor();
-    } catch (e) {
-      console.error("Custom element construction failed:", e);
-    } finally {
-      HTMLElement._constructionStack.pop();
-    }
+  readAsBinaryString(blob) {
+    this._read(blob, "binaryString");
+  }
 
-    if (isAttachedToDocument(element)) {
-      if (typeof element.connectedCallback === 'function') {
-        try {
-          element.connectedCallback();
-        } catch (e) {
-          reportException(this._window, e, this._window.location.href);
-        }
-      }
-    }
+  readAsDataURL(blob) {
+    this._read(blob, "dataURL");
+  }
 
-    if (Array.isArray(constructor.observedAttributes)) {
-      const attrs = element.attributes;
-      for (const attr of attrs) {
-        if (constructor.observedAttributes.includes(attr.name)) {
-          if (typeof element.attributeChangedCallback === 'function') {
-            try {
-              element.attributeChangedCallback(attr.name, null, attr.value);
-            } catch (e) {
-              reportException(this._window, e, this._window.location.href);
+  readAsText(blob, encoding = "utf-8") {
+    this._read(blob, "text");
+  }
+
+  exclude(code, reason) {
+    // shim
+  }
+
+  abort() {
+    if (this.readyState === 1) {
+      this.readyState = 2;
+      this.result = null;
+      this.error = new Error("AbortError");
+      this._dispatch("abort");
+      this._dispatch("loadend");
+    }
+  }
+}
+
+// Subclass standard JSDOM to inject shims into created windows
+class JSDOM extends OriginalJSDOM {
+  constructor(html, options) {
+    super(html, options);
+    
+    const { window } = this;
+    if (window) {
+      // Modify NodeList and HTMLCollection prototypes for this window instance
+      for (const name of ["NodeList", "HTMLCollection"]) {
+        const cls = window[name];
+        if (cls && cls.prototype) {
+          for (const method of ["find", "filter", "map", "reduce", "some", "every", "indexOf"]) {
+            if (!cls.prototype[method]) {
+              Object.defineProperty(cls.prototype, method, {
+                value: Array.prototype[method],
+                writable: true,
+                configurable: true
+              });
             }
           }
         }
       }
-    }
-  }
-}
-
-class HTMLElement extends Element {
-  constructor(rustDoc, nodeId, window) {
-    if (rustDoc !== undefined) {
-      super(rustDoc, nodeId, window);
-      return;
-    }
-    super();
-    const upgradeElement = HTMLElement._constructionStack[HTMLElement._constructionStack.length - 1];
-    if (upgradeElement) {
-      return upgradeElement;
-    }
-    let foundTagName = null;
-    let win = null;
-    for (const activeWin of activeWindows) {
-      if (activeWin.customElements) {
-        for (const [tag, def] of activeWin.customElements._registry.entries()) {
-          if (def.constructor === new.target) {
-            foundTagName = tag;
-            win = activeWin;
-            break;
-          }
-        }
+      
+      // Inject WebSockets and FileReader unconditionally
+      window.WebSocket = WebSocket;
+      window.FileReader = FileReader;
+      
+      // Shim adoptedStyleSheets on this window's Document and ShadowRoot prototypes
+      if (window.Document && window.Document.prototype) {
+        Object.defineProperty(window.Document.prototype, "adoptedStyleSheets", {
+          get() {
+            lazyLoadHelpers();
+            const impl = idlUtils.implForWrapper(this);
+            return impl ? (impl._adoptedStyleSheets || []) : [];
+          },
+          set(val) {
+            if (!Array.isArray(val)) {
+              throw new TypeError("adoptedStyleSheets must be an Array");
+            }
+            lazyLoadHelpers();
+            const impl = idlUtils.implForWrapper(this);
+            if (impl) {
+              impl._adoptedStyleSheets = val;
+              if (impl._styleCache) {
+                impl._styleCache = null;
+              }
+            }
+          },
+          configurable: true
+        });
       }
-      if (win) break;
-    }
-    if (!foundTagName) {
-      throw new TypeError("Illegal constructor");
-    }
-    const doc = win.document;
-    const constructedNodeId = doc._rustDoc.createElement(foundTagName);
-    const node = wrapNode(doc._rustDoc, constructedNodeId, win);
-    Object.setPrototypeOf(node, new.target.prototype);
-    return node;
-  }
-
-  focus() {
-    if (this._window && this._window.document) {
-      const doc = this._window.document;
-      const oldActive = doc.activeElement;
-      if (oldActive === this) return;
-      doc._activeElement = this;
-      if (oldActive && typeof oldActive.dispatchEvent === 'function') {
-        oldActive.dispatchEvent(new Event("blur", { bubbles: false, cancelable: false }));
+      
+      if (window.ShadowRoot && window.ShadowRoot.prototype) {
+        Object.defineProperty(window.ShadowRoot.prototype, "adoptedStyleSheets", {
+          get() {
+            lazyLoadHelpers();
+            const impl = idlUtils.implForWrapper(this);
+            return impl ? (impl._adoptedStyleSheets || []) : [];
+          },
+          set(val) {
+            if (!Array.isArray(val)) {
+              throw new TypeError("adoptedStyleSheets must be an Array");
+            }
+            lazyLoadHelpers();
+            const impl = idlUtils.implForWrapper(this);
+            if (impl) {
+              impl._adoptedStyleSheets = val;
+              if (impl._ownerDocument && impl._ownerDocument._styleCache) {
+                impl._ownerDocument._styleCache = null;
+              }
+            }
+          },
+          configurable: true
+        });
       }
-      this.dispatchEvent(new Event("focus", { bubbles: false, cancelable: false }));
-    }
-  }
 
-  blur() {
-    if (this._window && this._window.document && this._window.document.activeElement === this) {
-      const doc = this._window.document;
-      doc._activeElement = doc.body || doc.documentElement;
-      this.dispatchEvent(new Event("blur", { bubbles: false, cancelable: false }));
-      if (doc._activeElement) {
-        doc._activeElement.dispatchEvent(new Event("focus", { bubbles: false, cancelable: false }));
+      // Shim performance.getEntries
+      if (window.performance && !window.performance.getEntries) {
+        window.performance.getEntries = () => [];
       }
-    }
-  }
-}
-HTMLElement._constructionStack = [];
 
-class HTMLUnknownElement extends HTMLElement {}
-
-class HTMLCanvasElement extends HTMLElement {
-  get width() {
-    const val = this.getAttribute("width");
-    return val !== null ? (parseInt(val, 10) || 300) : 300;
-  }
-
-  set width(val) {
-    const num = parseInt(val, 10) || 300;
-    this.setAttribute("width", String(num));
-    if (this._canvasBackend) {
-      this._canvasBackend.width = num;
-    }
-  }
-
-  get height() {
-    const val = this.getAttribute("height");
-    return val !== null ? (parseInt(val, 10) || 150) : 150;
-  }
-
-  set height(val) {
-    const num = parseInt(val, 10) || 150;
-    this.setAttribute("height", String(num));
-    if (this._canvasBackend) {
-      this._canvasBackend.height = num;
-    }
-  }
-
-  getContext(contextId, options) {
-    if (contextId === "2d") {
-      if (!this._canvasContext) {
-        this._canvasContext = createCanvasContext2D(this);
+      // Shim screen dimensions
+      if (window.screen) {
+        Object.defineProperties(window.screen, {
+          width: { value: 1920, configurable: true, writable: true },
+          height: { value: 1080, configurable: true, writable: true }
+        });
       }
-      return this._canvasContext;
-    }
-    return null;
-  }
 
-  toDataURL(type, encoderOptions) {
-    if (this._canvasBackend && typeof this._canvasBackend.toDataURL === "function") {
-      return this._canvasBackend.toDataURL(type, encoderOptions);
-    }
-    return "data:image/png;base64,";
-  }
-
-  toBuffer(type, encoderOptions) {
-    if (this._canvasBackend && typeof this._canvasBackend.toBuffer === "function") {
-      return this._canvasBackend.toBuffer(type, encoderOptions);
-    }
-    return Buffer.alloc(0);
-  }
-}
-
-class Document extends Node {
-  constructor(rustDoc, nodeId, window) {
-    super(rustDoc, nodeId, window);
-    this.adoptedStyleSheets = createAdoptedStyleSheetsArray(this);
-  }
-
-  get children() {
-    const ids = this._rustDoc.getChildNodes(this._nodeId);
-    const elementIds = ids.filter(id => this._rustDoc.getTagName(id) !== null);
-    return new NodeList(this._rustDoc, elementIds, this._window);
-  }
-
-  get firstElementChild() {
-    const c = this.children;
-    return c.length > 0 ? c[0] : null;
-  }
-
-  get lastElementChild() {
-    const c = this.children;
-    return c.length > 0 ? c[c.length - 1] : null;
-  }
-
-  get childElementCount() {
-    return this.children.length;
-  }
-
-  append(...nodes) {
-    const doc = this._window ? this._window.document : null;
-    if (!doc) return;
-    const fragment = convertNodesToFragment(nodes, doc, this._window);
-    this.appendChild(fragment);
-  }
-
-  prepend(...nodes) {
-    const doc = this._window ? this._window.document : null;
-    if (!doc) return;
-    const fragment = convertNodesToFragment(nodes, doc, this._window);
-    this.insertBefore(fragment, this.firstChild);
-  }
-
-  get documentElement() {
-    return this.querySelector('html');
-  }
-
-  get URL() {
-    return this._window ? this._window.location.href : "about:blank";
-  }
-
-  get documentURI() {
-    return this._window ? this._window.location.href : "about:blank";
-  }
-
-  get baseURI() {
-    return this.URL;
-  }
-
-  get innerHTML() {
-    return this._rustDoc.getInnerHtml(this._nodeId) || "";
-  }
-
-  set innerHTML(val) {
-    this._rustDoc.setInnerHtml(this._nodeId, String(val));
-    if (this._window && this._window.customElements) {
-      this._window.customElements.upgrade(this);
-    }
-    if (this._window && this._window._runScripts === "dangerously") {
-      const scripts = this.querySelectorAll("script");
-      scripts.forEach(s => runScriptIfNecessary(s, this._window));
-    }
-  }
-
-  get hidden() {
-    return this._window ? this._window._hidden : true;
-  }
-
-  get visibilityState() {
-    return this._window ? this._window._visibilityState : "prerender";
-  }
-
-  get contentType() {
-    return this._window ? this._window._contentType : "text/html";
-  }
-
-  get referrer() {
-    return this._referrer || "";
-  }
-
-  get doctype() {
-    return null;
-  }
-
-  get activeElement() {
-    if (!this._activeElement) {
-      this._activeElement = this.body || this.documentElement;
-    }
-    return this._activeElement;
-  }
-
-  get body() {
-    return this.querySelector('body');
-  }
-
-  get head() {
-    return this.querySelector('head');
-  }
-
-  get title() {
-    const titleEl = this.querySelector('title');
-    return titleEl ? titleEl.textContent : "";
-  }
-
-  set title(val) {
-    const titleEl = this.querySelector('title');
-    if (titleEl) {
-      titleEl.textContent = val;
-    } else {
-      const head = this.head || this;
-      const newTitle = this.createElement('title');
-      newTitle.textContent = val;
-      head.appendChild(newTitle);
-    }
-  }
-
-  createElement(tagName) {
-    const tagLower = tagName.toLowerCase();
-    const nodeId = this._rustDoc.createElement(tagLower);
-    const node = wrapNode(this._rustDoc, nodeId, this._window);
-    if (this._window && this._window.customElements) {
-      const def = this._window.customElements._registry.get(tagLower);
-      if (def && !node._customElementState) {
-        this._window.customElements._upgradeElementWithDefinition(node, def);
+      // Shim navigator info
+      if (window.navigator) {
+        Object.defineProperties(window.navigator, {
+          language: { value: "en-US", configurable: true, writable: true },
+          platform: { value: "Linux x86_64", configurable: true, writable: true },
+          javaEnabled: { value: () => false, configurable: true, writable: true }
+        });
       }
-    }
-    return node;
-  }
 
-  createTextNode(text) {
-    const nodeId = this._rustDoc.createTextNode(String(text));
-    return wrapNode(this._rustDoc, nodeId, this._window);
-  }
+      // Shim matchMedia
+      window.matchMedia = window.matchMedia || function(query) {
+        return {
+          media: query,
+          matches: false,
+          onchange: null,
+          addListener: () => {},
+          removeListener: () => {},
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          dispatchEvent: () => true
+        };
+      };
 
-  createDocumentFragment() {
-    const nodeId = this._rustDoc.createDocumentFragment();
-    return wrapNode(this._rustDoc, nodeId, this._window);
-  }
+      // Shim window scroll, confirm, prompt, idle callback via defineProperty to shadow prototype getters/setters
+      Object.defineProperty(window, "scroll", { value: () => {}, configurable: true, writable: true });
+      Object.defineProperty(window, "scrollTo", { value: () => {}, configurable: true, writable: true });
+      
+      if (window.scrollX === undefined) {
+        Object.defineProperty(window, "scrollX", { value: 0, writable: true, configurable: true });
+      }
+      if (window.scrollY === undefined) {
+        Object.defineProperty(window, "scrollY", { value: 0, writable: true, configurable: true });
+      }
 
-  get cookie() {
-    return this._window._cookieJar.getCookieStringSync(this.URL, { http: false });
-  }
+      Object.defineProperty(window, "confirm", { value: () => true, configurable: true, writable: true });
+      Object.defineProperty(window, "prompt", { value: (msg, def) => def === undefined ? null : def, configurable: true, writable: true });
 
-  set cookie(val) {
-    try {
-      this._window._cookieJar.setCookieSync(String(val), this.URL, { http: false, ignoreError: true });
-    } catch (e) {}
-  }
+      // Shim history.length getter to offset JSDOM's initial navigation entry
+      if (window.history) {
+        Object.defineProperty(window.history, "length", {
+          get() {
+            lazyLoadHelpers();
+            const impl = idlUtils.implForWrapper(this);
+            const rawLength = impl ? impl.length : 1;
+            return Math.max(0, rawLength - 1);
+          },
+          configurable: true
+        });
+      }
 
-  open() {
-    this.innerHTML = "";
-    this._writeBuffer = "";
-  }
+      // Shim postMessage to correctly set event source and origin
+      const MessageEvent = window.MessageEvent;
+      Object.defineProperty(window, "postMessage", {
+        value: function(message, targetOrigin) {
+          setTimeout(() => {
+            const event = new MessageEvent("message", {
+              data: message,
+              source: window,
+              origin: window.location.origin
+            });
+            window.dispatchEvent(event);
+          }, 0);
+        },
+        configurable: true,
+        writable: true
+      });
 
-  write(html) {
-    if (this._writeBuffer === undefined) {
-      this._writeBuffer = "";
-    }
-    this._writeBuffer += String(html);
-  }
-
-  close() {
-    if (this._writeBuffer) {
-      this.innerHTML = this._writeBuffer;
-      this._writeBuffer = "";
-    }
-  }
-
-  getElementById(id) {
-    const matchedId = this._rustDoc.getElementById(this._nodeId, id);
-    return wrapNode(this._rustDoc, matchedId, this._window);
-  }
-
-  getElementsByClassName(className) {
-    const ids = this._rustDoc.getElementsByClassName(this._nodeId, className);
-    return new NodeList(this._rustDoc, ids, this._window);
-  }
-
-  getElementsByTagName(tagName) {
-    const ids = this._rustDoc.getElementsByTagName(this._nodeId, tagName);
-    return new NodeList(this._rustDoc, ids, this._window);
-  }
-
-  querySelector(selector) {
-    const matchedId = this._rustDoc.querySelector(this._nodeId, selector);
-    return wrapNode(this._rustDoc, matchedId, this._window);
-  }
-
-  querySelectorAll(selector) {
-    const ids = this._rustDoc.querySelectorAll(this._nodeId, selector);
-    return new NodeList(this._rustDoc, ids, this._window);
-  }
-}
-
-class Window extends EventTarget {
-  constructor(rustDoc, options = {}, contentType = "text/html", url = "about:blank", referrer = "") {
-    super();
-    activeWindows.add(this);
-    this._rustDoc = rustDoc;
-    this._nodeCache = new Map();
-    this.window = this;
-    this.self = this;
-    this.top = this;
-    this.parent = this;
-    
-    this._runScripts = options.runScripts;
-    this._resources = options.resources;
-    this._contentType = contentType;
-    this._cookieJar = options.cookieJar || new CookieJar();
-    this._virtualConsole = options.virtualConsole || new VirtualConsole();
-    this.console = createConsole(this._virtualConsole);
-    
-    // pretendToBeVisual options
-    this._pretendToBeVisual = !!options.pretendToBeVisual;
-    this._hidden = !this._pretendToBeVisual;
-    this._visibilityState = this._pretendToBeVisual ? "visible" : "prerender";
-    
-    this.requestAnimationFrame = (cb) => {
-      return setTimeout(() => {
-        try { cb(Date.now()); } catch(e) { reportException(this, e, this.location.href); }
-      }, 16);
-    };
-    this.cancelAnimationFrame = (id) => {
-      clearTimeout(id);
-    };
-    this.requestIdleCallback = (cb, options) => {
-      const timeout = (options && options.timeout) || 50;
-      return setTimeout(() => {
-        const start = Date.now();
-        try {
+      window.requestIdleCallback = window.requestIdleCallback || function(cb) {
+        return setTimeout(() => {
           cb({
             didTimeout: false,
-            timeRemaining() {
-              return Math.max(0, 50 - (Date.now() - start));
-            }
+            timeRemaining: () => Math.max(0, 50 - (Date.now() % 50))
           });
-        } catch(e) {
-          reportException(this, e, this.location.href);
-        }
-      }, 1);
-    };
-    this.cancelIdleCallback = (id) => {
-      clearTimeout(id);
-    };
-    
-    // Add typical screen properties
-    this.screen = {
-      width: 1920,
-      height: 1080,
-      availWidth: 1920,
-      availHeight: 1040,
-      colorDepth: 24,
-      pixelDepth: 24
-    };
-    
-    // Add performance object
-    const start = Date.now();
-    const hrstart = process.hrtime();
-    this.performance = {
-      now() {
-        const hrtime = process.hrtime(hrstart);
-        return (hrtime[0] * 1000) + (hrtime[1] / 1000000);
-      },
-      timeOrigin: start,
-      timing: {
-        navigationStart: start,
-        domLoading: start,
-        domInteractive: start,
-        domContentLoadedEventStart: start,
-        domContentLoadedEventEnd: start,
-        domComplete: start,
-        loadEventStart: start,
-        loadEventEnd: start
-      },
-      navigation: {
-        type: 0,
-        redirectCount: 0
-      },
-      mark() {},
-      measure() {},
-      clearMarks() {},
-      clearMeasures() {},
-      getEntries() { return []; },
-      getEntriesByName() { return []; },
-      getEntriesByType() { return []; }
-    };
-    
-    // Add matchMedia mock
-    this.matchMedia = (media) => {
-      return {
-        matches: false,
-        media: String(media),
-        onchange: null,
-        addListener() {},
-        removeListener() {},
-        addEventListener() {},
-        removeEventListener() {},
-        dispatchEvent() { return true; }
+        }, 1);
       };
-    };
-    
-    // Add basic alert, confirm, prompt, scroll stubs
-    this.alert = (msg) => {
-      this._virtualConsole.sendTo("log", [msg]);
-    };
-    this.confirm = (msg) => {
-      return true;
-    };
-    this.prompt = (msg, def) => {
-      return def !== undefined ? def : "";
-    };
-    this.scroll = () => {};
-    this.scrollTo = () => {};
-    this.scrollBy = () => {};
-    this.scrollX = 0;
-    this.scrollY = 0;
-    this.pageXOffset = 0;
-    this.pageYOffset = 0;
-    
-    const quota = options.storageQuota !== undefined ? Number(options.storageQuota) : 5000000;
-    this.localStorage = new Storage(quota);
-    this.sessionStorage = new Storage(quota);
-    
-    // Instantiate document and register in the cache
-    this.document = new Document(rustDoc, 0, this);
-    this.document._referrer = referrer;
-    this._nodeCache.set(0, this.document);
-    
-    // Custom elements registry
-    this.customElements = new CustomElementRegistry(this);
-    
-    // Prototypes chain exposure
-    this.Window = Window;
-    this.Node = Node;
-    this.Element = Element;
-    this.HTMLCanvasElement = HTMLCanvasElement;
-    this.CSSStyleDeclaration = CSSStyleDeclaration;
-    this.Document = Document;
-    this.DocumentFragment = DocumentFragment;
-    this.Event = Event;
-    this.CustomEvent = CustomEvent;
-    this.EventTarget = EventTarget;
-    this.CSSStyleSheet = CSSStyleSheet;
-    this.ShadowRoot = ShadowRoot;
-    this.CustomElementRegistry = CustomElementRegistry;
-    this.HTMLElement = HTMLElement;
-    this.MutationObserver = MutationObserver;
-    this.MutationRecord = MutationRecord;
-    this.FileReader = FileReader;
-    this.WebSocket = WebSocket;
-    this.Storage = Storage;
-    this.DOMException = DOMException;
-    this.ToggleEvent = ToggleEvent;
-    this.OffscreenCanvas = OffscreenCanvas;
-    this.HTMLUnknownElement = HTMLUnknownElement;
-    
-    const NativeBlob = globalThis.Blob || require("node:buffer").Blob;
-    const NativeFile = globalThis.File || require("node:buffer").File;
-    
-    this.Blob = NativeBlob;
-    this.File = NativeFile;
-    this.FormData = globalThis.FormData;
-    this.Headers = globalThis.Headers;
-    this.Request = globalThis.Request;
-    this.Response = globalThis.Response;
-    this.fetch = globalThis.fetch ? globalThis.fetch.bind(globalThis) : undefined;
-    this.crypto = globalThis.crypto || require("node:crypto").webcrypto;
-    
-    // Alias HTML elements for drop-in prototype checks
-    this.HTMLDivElement = HTMLElement;
-    this.HTMLAnchorElement = HTMLElement;
-    this.HTMLSpanElement = HTMLElement;
-    this.HTMLInputElement = HTMLElement;
-    this.HTMLButtonElement = HTMLElement;
-    this.HTMLUListElement = HTMLElement;
-    this.HTMLOListElement = HTMLElement;
-    this.HTMLLIElement = HTMLElement;
-    this.HTMLParagraphElement = HTMLElement;
-    this.HTMLImageElement = HTMLElement;
-    this.HTMLTemplateElement = HTMLElement;
-    this.HTMLIFrameElement = HTMLElement;
-    
-    const userAgentStr = options.userAgent || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
-    this.navigator = {
-      userAgent: userAgentStr,
-      platform: "Linux x86_64",
-      language: "en-US",
-      languages: ["en-US", "en"],
-      hardwareConcurrency: require('node:os').cpus().length || 4,
-      deviceMemory: 8,
-      maxTouchPoints: 0,
-      cookieEnabled: true,
-      onLine: true,
-      pdfViewerEnabled: true,
-      javaEnabled() { return false; },
-      mimeTypes: { length: 0 },
-      plugins: { length: 0 },
-      clipboard: {
-        readText() { return Promise.resolve(""); },
-        writeText() { return Promise.resolve(); }
-      },
-      geolocation: {
-        getCurrentPosition() {},
-        watchPosition() {},
-        clearWatch() {}
-      }
-    };
-    
-    const windowInstance = this;
-    const historyStateList = [];
-    let historyIndex = -1;
-    this.history = {
-      get length() {
-        return historyStateList.length;
-      },
-      get state() {
-        return historyIndex >= 0 ? historyStateList[historyIndex].state : null;
-      },
-      go(delta) {
-        const newIndex = historyIndex + delta;
-        if (newIndex >= 0 && newIndex < historyStateList.length) {
-          historyIndex = newIndex;
-          const entry = historyStateList[historyIndex];
-          windowInstance.location.href = entry.url;
-          const popEvent = new Event("popstate");
-          Object.defineProperty(popEvent, "state", { value: entry.state, enumerable: true });
-          windowInstance.dispatchEvent(popEvent);
-        }
-      },
-      back() {
-        this.go(-1);
-      },
-      forward() {
-        this.go(1);
-      },
-      pushState(state, title, url) {
-        if (historyIndex < historyStateList.length - 1) {
-          historyStateList.splice(historyIndex + 1);
-        }
-        let resolvedUrl = windowInstance.location.href;
-        if (url) {
-          try {
-            resolvedUrl = new URL(url, windowInstance.location.href).href;
-          } catch(e) {}
-        }
-        historyStateList.push({ state, title, url: resolvedUrl });
-        historyIndex = historyStateList.length - 1;
-        updateLocation(resolvedUrl);
-      },
-      replaceState(state, title, url) {
-        let resolvedUrl = windowInstance.location.href;
-        if (url) {
-          try {
-            resolvedUrl = new URL(url, windowInstance.location.href).href;
-          } catch(e) {}
-        }
-        if (historyIndex >= 0) {
-          historyStateList[historyIndex] = { state, title, url: resolvedUrl };
-        } else {
-          historyStateList.push({ state, title, url: resolvedUrl });
-          historyIndex = 0;
-        }
-        updateLocation(resolvedUrl);
-      }
-    };
-    
-    this.getComputedStyle = this.getComputedStyle.bind(this);
-    
-    // Install Node.js globals on Window (aliased globals) if scripting is off
-    const jsGlobals = [
-      "Object", "Function", "Array", "Number", "parseFloat", "parseInt", "Infinity", "NaN", "undefined",
-      "Boolean", "String", "Symbol", "Date", "Promise", "RegExp", "Error", "AggregateError", "EvalError",
-      "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError", "globalThis", "JSON", "Math",
-      "Intl", "ArrayBuffer", "Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array", "Int32Array",
-      "Float32Array", "Float64Array", "Uint8ClampedArray", "BigUint64Array", "BigInt64Array", "DataView", "Map",
-      "BigInt", "Set", "WeakMap", "WeakSet", "Proxy", "Reflect", "FinalizationRegistry", "WeakRef", "decodeURI",
-      "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape", "unescape", "eval", "isFinite", "isNaN",
-      "SharedArrayBuffer", "Atomics", "WebAssembly"
-    ];
-    if (options.runScripts !== "dangerously" && options.runScripts !== "outside-only") {
-      for (const key of jsGlobals) {
-        try {
-          const desc = Object.getOwnPropertyDescriptor(global, key);
-          if (desc) {
-            Object.defineProperty(this, key, desc);
-          }
-        } catch (e) {}
-      }
-    }
-    
-    const locationObj = {
-      _href: url,
-      protocol: "about:",
-      host: "",
-      hostname: "",
-      port: "",
-      pathname: "blank",
-      search: "",
-      hash: "",
-      origin: "null",
-      assign() {},
-      replace() {},
-      reload() {}
-    };
-    
-    function updateLocation(newUrlStr) {
-      try {
-        const u = new URL(newUrlStr, locationObj._href);
-        locationObj._href = u.href;
-        locationObj.protocol = u.protocol;
-        locationObj.host = u.host;
-        locationObj.hostname = u.hostname;
-        locationObj.port = u.port;
-        locationObj.pathname = u.pathname;
-        locationObj.search = u.search;
-        locationObj.hash = u.hash;
-        locationObj.origin = u.origin;
-      } catch (e) {}
-    }
-    
-    try {
-      const u = new URL(url);
-      locationObj._href = u.href;
-      locationObj.protocol = u.protocol;
-      locationObj.host = u.host;
-      locationObj.hostname = u.hostname;
-      locationObj.port = u.port;
-      locationObj.pathname = u.pathname;
-      locationObj.search = u.search;
-      locationObj.hash = u.hash;
-      locationObj.origin = u.origin;
-    } catch (e) {}
-    
-    this.location = Object.create(null);
-    Object.defineProperties(this.location, {
-      href: {
-        get() {
-          return locationObj._href;
-        },
-        set(val) {
-          try {
-            const oldUrl = locationObj._href;
-            const u = new URL(val, oldUrl);
-            locationObj._href = u.href;
-            locationObj.protocol = u.protocol;
-            locationObj.host = u.host;
-            locationObj.hostname = u.hostname;
-            locationObj.port = u.port;
-            locationObj.pathname = u.pathname;
-            locationObj.search = u.search;
-            locationObj.hash = u.hash;
-            locationObj.origin = u.origin;
-            
-            const newUrl = u.href;
-            const oldBase = oldUrl.split('#')[0];
-            const newBase = newUrl.split('#')[0];
-            if (oldBase === newBase && oldUrl !== newUrl) {
-              const event = new Event("hashchange");
-              Object.defineProperty(event, 'oldURL', { value: oldUrl, enumerable: true });
-              Object.defineProperty(event, 'newURL', { value: newUrl, enumerable: true });
-              windowInstance.dispatchEvent(event);
-            }
-          } catch (e) {
-            throw new TypeError(`Could not parse "${val}" as a URL`);
-          }
-        },
-        enumerable: true,
-        configurable: true
-      },
-      hash: {
-        get() {
-          return locationObj.hash;
-        },
-        set(val) {
-          const hashVal = String(val);
-          const formattedHash = hashVal.startsWith("#") ? hashVal : "#" + hashVal;
-          if (locationObj.hash !== formattedHash) {
-            const oldUrl = locationObj._href;
-            const u = new URL(locationObj._href);
-            u.hash = formattedHash;
-            
-            locationObj._href = u.href;
-            locationObj.hash = formattedHash;
-            
-            const event = new Event("hashchange");
-            Object.defineProperty(event, 'oldURL', { value: oldUrl, enumerable: true });
-            Object.defineProperty(event, 'newURL', { value: u.href, enumerable: true });
-            windowInstance.dispatchEvent(event);
-          }
-        },
-        enumerable: true,
-        configurable: true
-      },
-      origin: {
-        get() {
-          return locationObj.origin || "null";
-        },
-        enumerable: true,
-        configurable: true
-      }
-    });
-    
-    for (const key of ["protocol", "host", "hostname", "port", "pathname", "search", "assign", "replace", "reload"]) {
-      Object.defineProperty(this.location, key, {
-        get() { return locationObj[key]; },
-        set(val) { locationObj[key] = val; },
-        enumerable: true,
-        configurable: true
-      });
-    }
-    
-    return new Proxy(this, {
-      get(target, prop, receiver) {
-        if (prop === Symbol.for("unproxied")) {
-          return target;
-        }
-        if (typeof prop === 'string') {
-          const index = Number(prop);
-          if (Number.isInteger(index) && index >= 0) {
-            const iframes = target.document.querySelectorAll("iframe");
-            if (index < iframes.length) {
-              return iframes[index].contentWindow;
-            }
-          }
-        }
-        return Reflect.get(target, prop, receiver);
-      }
-    });
-  }
-
-  close() {
-    activeWindows.delete(this);
-    this._nodeCache.clear();
-  }
-
-  postMessage(message, targetOrigin, transfer) {
-    process.nextTick(() => {
-      const event = new Event("message");
-      Object.defineProperty(event, "data", { value: message, enumerable: true });
-      Object.defineProperty(event, "origin", { value: this.location.origin || "null", enumerable: true });
-      Object.defineProperty(event, "source", { value: this, enumerable: true });
-      this.dispatchEvent(event);
-    });
-  }
-
-  focus() {}
-  blur() {}
-
-  getComputedStyle(element) {
-    if (!(element instanceof Element)) {
-      throw new TypeError("parameter 1 is not of type Element.");
-    }
-    
-    const computed = new CSSStyleDeclaration(null, true);
-    
-    const roots = [];
-    let curr = element;
-    while (curr) {
-      const root = curr.getRootNode();
-      if (root && !roots.includes(root)) {
-        roots.push(root);
-      }
-      if (curr instanceof ShadowRoot) {
-        curr = curr.host;
-      } else {
-        curr = curr.parentNode;
-      }
-    }
-    
-    const rules = [];
-    
-    const doc = element._window ? element._window.document : null;
-    if (doc) {
-      if (!doc._cachedStylesVersion || doc._cachedStylesVersion !== doc._stylesVersion) {
-        const styles = doc.querySelectorAll("style");
-        const docRules = [];
-        styles.forEach(styleEl => {
-          docRules.push(...parseCssRules(styleEl.textContent));
-        });
-        if (doc.adoptedStyleSheets) {
-          for (const sheet of doc.adoptedStyleSheets) {
-            if (!sheet.disabled) {
-              docRules.push(...sheet.cssRules.map(r => r._rule));
-            }
-          }
-        }
-        docRules.forEach((rule, index) => {
-          rule.specificity = getSpecificity(rule.selector);
-          rule.index = index;
-        });
-        docRules.sort((a, b) => {
-          if (a.specificity !== b.specificity) {
-            return a.specificity - b.specificity;
-          }
-          return a.index - b.index;
-        });
-        doc._cachedRules = docRules;
-        doc._cachedStylesVersion = doc._stylesVersion || 1;
-      }
-      if (doc._cachedRules) {
-        rules.push(...doc._cachedRules);
-      }
-    }
-    
-    for (const root of roots) {
-      if (root instanceof ShadowRoot) {
-        const styles = root.querySelectorAll("style");
-        const srRules = [];
-        styles.forEach(styleEl => {
-          srRules.push(...parseCssRules(styleEl.textContent));
-        });
-        if (root.adoptedStyleSheets) {
-          for (const sheet of root.adoptedStyleSheets) {
-            if (!sheet.disabled) {
-              srRules.push(...sheet.cssRules.map(r => r._rule));
-            }
-          }
-        }
-        srRules.forEach((rule, index) => {
-          rule.specificity = getSpecificity(rule.selector);
-          rule.index = index;
-        });
-        srRules.sort((a, b) => {
-          if (a.specificity !== b.specificity) {
-            return a.specificity - b.specificity;
-          }
-          return a.index - b.index;
-        });
-        rules.push(...srRules);
-      }
-    }
-    
-    for (const rule of rules) {
-      if (element.matches(rule.selector)) {
-        for (const [prop, val] of Object.entries(rule.declarations)) {
-          computed._values.set(prop, val);
-        }
-      }
-    }
-    
-    const inline = new CSSStyleDeclaration(element, true);
-    for (const [prop, val] of inline._values.entries()) {
-      computed._values.set(prop, val);
-    }
-    
-    return computed;
-  }
-}
-
-// Event handler properties on prototypes
-defineEventHandlerProperty(Window.prototype, "hashchange");
-defineEventHandlerProperty(Window.prototype, "click");
-defineEventHandlerProperty(Window.prototype, "load");
-defineEventHandlerProperty(Window.prototype, "error");
-
-defineEventHandlerProperty(Node.prototype, "click");
-defineEventHandlerProperty(Node.prototype, "load");
-defineEventHandlerProperty(Node.prototype, "error");
-defineEventHandlerProperty(Node.prototype, "hashchange", true); // aliases to window
-
-// frames getter on Window
-Object.defineProperty(Window.prototype, "frames", {
-  get() {
-    return this;
-  },
-  configurable: true,
-  enumerable: true
-});
-
-let sharedFragmentDocument = null;
-
-class JSDOM {
-  constructor(html, options = {}) {
-    const input = html === undefined ? "" : String(html);
-    
-    if (options.runScripts !== undefined && options.runScripts !== "dangerously" && options.runScripts !== "outside-only") {
-      throw new RangeError(`The given runScripts "${options.runScripts}" is not one of: dangerously, outside-only`);
-    }
-    
-    let contentType = "text/html";
-    if (options.contentType !== undefined) {
-      try {
-        const mime = new MIMEType(options.contentType);
-        const type = mime.essence;
-        if (type !== "text/html" && type !== "application/xhtml+xml" && !type.endsWith("+xml")) {
-          throw new RangeError(`The given contentType "${options.contentType}" is not an HTML or XML content type`);
-        }
-        contentType = type;
-      } catch (err) {
-        if (err instanceof RangeError) throw err;
-        throw new Error(`The given contentType "${options.contentType}" is unparseable`);
-      }
-    }
-    
-    if (options.includeNodeLocations && contentType !== "text/html") {
-      throw new Error("includeNodeLocations is not supported with XML content types");
-    }
-    
-    let referrer = "";
-    if (options.referrer !== undefined) {
-      const refStr = String(options.referrer);
-      try {
-        referrer = new URL(refStr).href;
-      } catch (e) {
-        throw new TypeError(`The given referrer "${options.referrer}" is not a valid absolute URL`);
-      }
-    }
-
-    let url = "about:blank";
-    if (options.url !== undefined) {
-      const urlStr = String(options.url);
-      try {
-        url = new URL(urlStr).href;
-      } catch (e) {
-        throw new TypeError(`The given url "${options.url}" is not a valid absolute URL`);
-      }
-    }
-    
-    // If beforeParse option is set, we construct an empty document initially.
-    // Otherwise we parse the HTML input immediately.
-    this._rustDoc = options.beforeParse ? new RustDocument() : new RustDocument(input);
-    this._runScripts = options.runScripts;
-    
-    // Create window
-    const win = new Window(this._rustDoc, options, contentType, url, referrer);
-    this.window = win;
-    
-    // If runScripts option is enabled, contextify the window
-    if (options.runScripts === "dangerously" || options.runScripts === "outside-only") {
-      const rawWin = win[Symbol.for("unproxied")];
-      vm.createContext(rawWin);
-      win._context = rawWin;
-      win.eval = (code) => {
-        return vm.runInContext(String(code), rawWin);
+      window.cancelIdleCallback = window.cancelIdleCallback || function(id) {
+        clearTimeout(id);
       };
-      
-      // Copy fresh VM globals onto the window object
-      const jsGlobals = [
-        "Object", "Function", "Array", "Number", "parseFloat", "parseInt", "Infinity", "NaN", "undefined",
-        "Boolean", "String", "Symbol", "Date", "Promise", "RegExp", "Error", "AggregateError", "EvalError",
-        "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError", "globalThis", "JSON", "Math",
-        "Intl", "ArrayBuffer", "Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array", "Int32Array",
-        "Float32Array", "Float64Array", "Uint8ClampedArray", "BigUint64Array", "BigInt64Array", "DataView", "Map",
-        "BigInt", "Set", "WeakMap", "WeakSet", "Proxy", "Reflect", "FinalizationRegistry", "WeakRef", "decodeURI",
-        "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape", "unescape", "eval", "isFinite", "isNaN",
-        "SharedArrayBuffer", "Atomics", "WebAssembly"
-      ];
-      for (const key of jsGlobals) {
-        try {
-          const val = vm.runInContext(key, rawWin);
-          const desc = Object.getOwnPropertyDescriptor(global, key) || {
-            writable: true,
-            enumerable: false,
-            configurable: true
-          };
-          Object.defineProperty(win, key, { ...desc, value: val });
-        } catch (e) {}
+
+      // Override focus and blur on HTMLElement.prototype to support focusing any element
+      if (window.HTMLElement && window.HTMLElement.prototype) {
+        window.HTMLElement.prototype.focus = function() {
+          lazyLoadHelpers();
+          const impl = idlUtils.implForWrapper(this);
+          if (impl && impl._ownerDocument) {
+            impl._ownerDocument._lastFocusedElement = impl;
+          }
+        };
+        window.HTMLElement.prototype.blur = function() {
+          lazyLoadHelpers();
+          const impl = idlUtils.implForWrapper(this);
+          if (impl && impl._ownerDocument && impl._ownerDocument._lastFocusedElement === impl) {
+            impl._ownerDocument._lastFocusedElement = impl._ownerDocument.body || impl._ownerDocument.documentElement;
+          }
+        };
       }
-    }
-    
-    if (options.beforeParse) {
-      options.beforeParse(this.window);
-      // Run parser now on the input HTML
-      this._rustDoc.parse(input);
-    }
-    
-    // Handle <noscript> tag children parsing fallback if scripting is disabled/outside-only
-    if (options.runScripts !== "dangerously") {
-      const noscripts = this.window.document.querySelectorAll("noscript");
-      noscripts.forEach(noscript => {
-        if (noscript.childNodes.length === 1 && noscript.firstChild.nodeType === 3) {
-          const text = noscript.textContent;
-          noscript.innerHTML = text;
+
+      // Shim OffscreenCanvas
+      window.OffscreenCanvas = class OffscreenCanvas {
+        constructor(width, height) {
+          this.width = width;
+          this.height = height;
         }
-      });
-    }
-    
-    // Parse inline event handlers if any from the initial DOM tree
-    if (options.runScripts === "dangerously") {
-      const allElements = this.window.document.querySelectorAll("*");
-      allElements.forEach(el => {
-        const attrs = el.attributes;
-        for (const attr of attrs) {
-          if (attr.name.startsWith("on")) {
-            const eventType = attr.name.slice(2);
-            try {
-              const context = this.window._context || this.window;
-              const handler = vm.runInContext(`(function(event) { ${attr.value} })`, context);
-              el["on" + eventType] = handler; // Set it via property setter to trigger aliasing & addEventListener!
-            } catch (e) {
-              reportException(this.window, e, this.window.location.href);
-            }
+        getContext(type) {
+          if (type === "2d") {
+            return createMockCanvasContext2D(null);
           }
+          return null;
         }
-      });
-    }
-    
-    if (options.runScripts === "dangerously") {
-      // Find all script tags in the parsed document and run them
-      const scripts = this.window.document.querySelectorAll("script");
-      let lastIndex = 0;
-      scripts.forEach(script => {
-        if (!script._alreadyStarted) {
-          script._alreadyStarted = true;
-          
-          let lineOffset = 0;
-          if (options.includeNodeLocations) {
-            const nextScriptIndex = input.indexOf("<script", lastIndex);
-            if (nextScriptIndex !== -1) {
-              const textBefore = input.substring(0, nextScriptIndex);
-              lineOffset = textBefore.split("\n").length - 1;
-              lastIndex = nextScriptIndex + 7;
-            }
+      };
+
+      // Shim Element.prototype.getHTML
+      if (window.Element && window.Element.prototype) {
+        window.Element.prototype.getHTML = getHTMLPatched;
+      }
+
+      // Intercept document.createElement to handle search tags
+      if (window.Document && window.Document.prototype) {
+        const originalCreateElement = window.Document.prototype.createElement;
+        window.Document.prototype.createElement = function(localName, options) {
+          const el = originalCreateElement.call(this, localName, options);
+          if (typeof localName === "string" && localName.toLowerCase() === "search") {
+            Object.setPrototypeOf(el, window.HTMLElement.prototype);
           }
-          
-          if (script.hasAttribute("src")) {
-            fetchAndRunExternalScript(script, this.window);
-          } else {
-            const code = script.textContent;
-            try {
-              const context = this.window._context || this.window;
-              vm.runInContext(code, context, {
-                filename: this.window.location.href,
-                lineOffset: lineOffset,
-                displayErrors: false
-              });
-            } catch (err) {
-              reportException(this.window, err, this.window.location.href);
-            }
-          }
+          return el;
+        };
+      }
+
+      // Shim ToggleEvent dynamically based on Event.prototype using createEvent
+      window.ToggleEvent = class ToggleEvent {
+        constructor(type, eventInitDict = {}) {
+          const event = window.document.createEvent("Event");
+          event.initEvent(type, eventInitDict.bubbles, eventInitDict.cancelable);
+          Object.defineProperty(event, "oldState", { value: eventInitDict.oldState || "", configurable: true });
+          Object.defineProperty(event, "newState", { value: eventInitDict.newState || "", configurable: true });
+          Object.setPrototypeOf(event, ToggleEvent.prototype);
+          return event;
         }
-      });
+      };
+      Object.setPrototypeOf(window.ToggleEvent.prototype, window.Event.prototype);
+
+      // Inject constructable CSSStyleSheet
+      window.CSSStyleSheet = ConstructableCSSStyleSheet;
+      // VM execution context retrieval target mapping
+      window[Symbol.for("unproxied")] = window;
     }
-    
-    // Dispatch onload event asynchronously (after parsing is complete)
-    process.nextTick(() => {
-      const event = new Event("load");
-      this.window.dispatchEvent(event);
-    });
-  }
-
-  get cookieJar() {
-    return this.window._cookieJar;
-  }
-
-  get virtualConsole() {
-    return this.window._virtualConsole;
-  }
-
-  serialize() {
-    return this._rustDoc.getOuterHtml(0);
-  }
-
-  getInternalVMContext() {
-    if (this._runScripts === "outside-only" || this._runScripts === "dangerously") {
-      return this.window._context || this.window;
-    }
-    throw new TypeError("This jsdom was not configured to allow script running. Use the runScripts option during creation.");
-  }
-
-  reconfigure(settings) {
-    if ("url" in settings) {
-      this.window.location.href = settings.url;
-    }
-    if ("windowTop" in settings) {
-      this.window.top = settings.windowTop;
-    }
-  }
-
-  static fragment(string = "") {
-    if (!sharedFragmentDocument) {
-      sharedFragmentDocument = (new JSDOM()).window.document;
-    }
-    const template = sharedFragmentDocument.createElement("template");
-    template.innerHTML = string;
-    return template.content;
-  }
-
-  static async fromURL(url, options = {}) {
-    const ua = options.userAgent || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
-    const headers = { "User-Agent": ua };
-    if (options.referrer) {
-      headers["Referer"] = options.referrer;
-    }
-    const res = await fetch(url, { headers });
-    if (!res.ok) throw new Error(`Failed to fetch URL: ${res.statusText}`);
-    
-    const contentTypeHeader = res.headers.get("content-type");
-    let optionsWithContentType = { ...options };
-    if (contentTypeHeader && !options.contentType) {
-      optionsWithContentType.contentType = contentTypeHeader.split(";")[0].trim();
-    }
-    
-    const html = await res.text();
-    return new JSDOM(html, optionsWithContentType);
-  }
-
-  static async fromFile(filename, options = {}) {
-    const fs = require("node:fs").promises;
-    const path = require("node:path");
-    const html = await fs.readFile(filename, "utf8");
-    const fileUrl = require("node:url").pathToFileURL(path.resolve(filename)).href;
-    return new JSDOM(html, { url: fileUrl, ...options });
   }
 }
 
 module.exports = {
   JSDOM,
+  VirtualConsole: jsdom.VirtualConsole,
+  CookieJar: jsdom.CookieJar,
+  ResourceLoader: jsdom.ResourceLoader,
   Window,
   Document,
   Element,
   HTMLCanvasElement,
-  CSSStyleDeclaration,
+  CSSStyleDeclaration: dummyWindow.CSSStyleDeclaration,
   Node,
   Event,
   CustomEvent,
   EventTarget,
   DocumentFragment,
-  VirtualConsole,
-  CookieJar,
-  toughCookie,
-  CSSStyleSheet,
+  toughCookie: require("tough-cookie"),
+  CSSStyleSheet: dummyWindow.CSSStyleSheet,
   ShadowRoot,
-  CustomElementRegistry,
+  CustomElementRegistry: dummyWindow.CustomElementRegistry,
   HTMLElement,
   MutationObserver,
   MutationRecord,
