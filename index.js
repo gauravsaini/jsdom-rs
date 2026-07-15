@@ -1,8 +1,38 @@
-const { RustDocument } = require('./jsdom_rs.node');
 const EventEmitter = require('node:events');
 const vm = require('node:vm');
 const { MIMEType } = require('whatwg-mimetype');
 const toughCookie = require('tough-cookie');
+
+let nativeBinding;
+try {
+  nativeBinding = require('./jsdom_rs.node');
+} catch (e) {
+  // If the direct symlink fails or is missing, try to resolve platform-specific names loaded by napi-rs
+  const platform = process.platform;
+  const arch = process.arch;
+  const libc = platform === 'linux' ? (process.report?.getReport?.().header?.glibcVersionRuntime ? 'gnu' : 'musl') : '';
+  
+  const possibleNames = [
+    `./jsdom_rs.${platform}-${arch}${libc ? '-' + libc : ''}.node`,
+    `./jsdom_rs.${platform}-${arch}.node`,
+    `./jsdom_rs.node`
+  ];
+  
+  let loaded = false;
+  for (const name of possibleNames) {
+    try {
+      nativeBinding = require(name);
+      loaded = true;
+      break;
+    } catch (err) {}
+  }
+  
+  if (!loaded) {
+    throw new Error(`Failed to load native binding jsdom_rs. Tried: ${possibleNames.join(', ')}. Underlying error: ${e.message}`);
+  }
+}
+
+const { RustDocument } = nativeBinding;
 
 const activeWindows = new Set();
 
