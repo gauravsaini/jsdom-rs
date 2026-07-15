@@ -705,7 +705,7 @@ function wrapNode(rustDoc, nodeId, window) {
       if (tagUpper === "CANVAS") {
         node = new HTMLCanvasElement(rustDoc, nodeId, window);
       } else {
-        node = new Element(rustDoc, nodeId, window);
+        node = new HTMLElement(rustDoc, nodeId, window);
       }
     } else {
       const val = rustDoc.getNodeValue(nodeId);
@@ -764,7 +764,12 @@ class Node extends EventTarget {
   }
 
   set nodeValue(val) {
-    this._rustDoc.setNodeValue(this._nodeId, val === null ? null : String(val));
+    const oldVal = this.nodeValue;
+    const valStr = val === null ? null : String(val);
+    if (oldVal !== valStr) {
+      this._rustDoc.setNodeValue(this._nodeId, valStr);
+      notifyMutation(new MutationRecord("characterData", this, [], [], null, oldVal));
+    }
   }
 
   get parentNode() {
@@ -809,18 +814,39 @@ class Node extends EventTarget {
 
   set textContent(val) {
     if (this.tagName === "STYLE") markStylesDirty(this);
-    this._rustDoc.setTextContent(this._nodeId, String(val));
+    const removedNodes = Array.from(this.childNodes);
+    const valStr = String(val);
+    this._rustDoc.setTextContent(this._nodeId, valStr);
+    const addedNodes = valStr ? Array.from(this.childNodes) : [];
+    notifyMutation(new MutationRecord("childList", this, addedNodes, removedNodes));
+  }
+
+  contains(otherNode) {
+    if (!(otherNode instanceof Node)) {
+      return false;
+    }
+    let curr = otherNode;
+    while (curr) {
+      if (curr === this) return true;
+      curr = curr.parentNode;
+    }
+    return false;
   }
 
   appendChild(child) {
     if (child instanceof Node) {
       if (child.tagName === "STYLE") markStylesDirty(this);
       const isConnectedBefore = isAttachedToDocument(child);
+      const oldParent = child.parentNode;
+      if (oldParent) {
+        oldParent.removeChild(child);
+      }
       this._rustDoc.appendChild(this._nodeId, child._nodeId);
       triggerConnectionLifecycle(child, isConnectedBefore);
       if (this._window && this._window._runScripts === "dangerously") {
         runScriptIfNecessary(child, this._window);
       }
+      notifyMutation(new MutationRecord("childList", this, [child], []));
       return child;
     }
     throw new Error("Parameter 1 of Node.appendChild is not of type Node.");
@@ -832,6 +858,7 @@ class Node extends EventTarget {
       const isConnectedBefore = isAttachedToDocument(child);
       this._rustDoc.removeChild(this._nodeId, child._nodeId);
       triggerConnectionLifecycle(child, isConnectedBefore);
+      notifyMutation(new MutationRecord("childList", this, [], [child]));
       return child;
     }
     throw new Error("Parameter 1 of Node.removeChild is not of type Node.");
@@ -847,11 +874,16 @@ class Node extends EventTarget {
     if (newChild.tagName === "STYLE") markStylesDirty(this);
     const refId = refChild ? refChild._nodeId : null;
     const isConnectedBefore = isAttachedToDocument(newChild);
+    const oldParent = newChild.parentNode;
+    if (oldParent) {
+      oldParent.removeChild(newChild);
+    }
     this._rustDoc.insertBefore(this._nodeId, newChild._nodeId, refId);
     triggerConnectionLifecycle(newChild, isConnectedBefore);
     if (this._window && this._window._runScripts === "dangerously") {
       runScriptIfNecessary(newChild, this._window);
     }
+    notifyMutation(new MutationRecord("childList", this, [newChild], []));
     return newChild;
   }
 
@@ -865,6 +897,10 @@ class Node extends EventTarget {
     if (newChild.tagName === "STYLE" || oldChild.tagName === "STYLE") markStylesDirty(this);
     const isConnectedNewBefore = isAttachedToDocument(newChild);
     const isConnectedOldBefore = isAttachedToDocument(oldChild);
+    const oldParent = newChild.parentNode;
+    if (oldParent) {
+      oldParent.removeChild(newChild);
+    }
     const ret = this._rustDoc.replaceChild(this._nodeId, newChild._nodeId, oldChild._nodeId);
     if (ret !== null) {
       triggerConnectionLifecycle(newChild, isConnectedNewBefore);
@@ -872,6 +908,7 @@ class Node extends EventTarget {
       if (this._window && this._window._runScripts === "dangerously") {
         runScriptIfNecessary(newChild, this._window);
       }
+      notifyMutation(new MutationRecord("childList", this, [newChild], [oldChild]));
       return oldChild;
     }
     throw new Error("Old child not found in parent.");
@@ -1013,6 +1050,209 @@ class ShadowRoot extends DocumentFragment {
   }
 }
 
+const activeObservers = new Set();
+
+class MutationRecord {
+  constructor(type, target, addedNodes = [], removedNodes = [], attributeName = null, oldValue = null) {
+    this.type = type;
+    this.target = target;
+    this.addedNodes = addedNodes;
+    this.removedNodes = removedNodes;
+    this.attributeName = attributeName;
+    this.oldValue = oldValue;
+  }
+}
+
+class MutationObserver {
+  constructor(callback) {
+    this.callback = callback;
+    this.records = [];
+    this.targets = new Map();
+  }
+
+  observe(target, options) {
+    if (!(target instanceof Node)) {
+      throw new TypeError("parameter 1 is not of type Node.");
+    }
+    this.targets.set(target, options);
+    activeObservers.add(this);
+  }
+
+  disconnect() {
+    this.targets.clear();
+    activeObservers.delete(this);
+  }
+
+  takeRecords() {
+    const r = this.records;
+    this.records = [];
+    return r;
+  }
+}
+
+function notifyMutation(record) {
+  if (activeObservers.size === 0) return;
+  for (const obs of activeObservers) {
+    let matched = false;
+    for (const [target, options] of obs.targets.entries()) {
+      let isTarget = target === record.target;
+      let isSubtree = options.subtree && target.contains(record.target);
+      if (isTarget || isSubtree) {
+        if (record.type === "attributes" && options.attributes) {
+          if (!options.attributeFilter || options.attributeFilter.includes(record.attributeName)) {
+            matched = true;
+          }
+        } else if (record.type === "childList" && options.childList) {
+          matched = true;
+        } else if (record.type === "characterData" && options.characterData) {
+          matched = true;
+        }
+      }
+    }
+    if (matched) {
+      obs.records.push(record);
+      if (!obs._queued) {
+        obs._queued = true;
+        queueMicrotask(() => {
+          obs._queued = false;
+          if (obs.records.length > 0) {
+            try {
+              obs.callback(obs.takeRecords(), obs);
+            } catch (e) {
+              // Ignore or report
+            }
+          }
+        });
+      }
+    }
+  }
+}
+
+class FileReader extends EventTarget {
+  constructor() {
+    super();
+    this.readyState = 0; // EMPTY
+    this.result = null;
+    this.error = null;
+    this.onloadstart = null;
+    this.onprogress = null;
+    this.onload = null;
+    this.onabort = null;
+    this.onerror = null;
+    this.onloadend = null;
+  }
+
+  _dispatch(type, eventProps = {}) {
+    const ev = new Event(type);
+    Object.assign(ev, eventProps);
+    if (typeof this["on" + type] === "function") {
+      this["on" + type](ev);
+    }
+    this.dispatchEvent(ev);
+  }
+
+  _read(blob, format) {
+    if (this.readyState === 1) {
+      throw new Error("InvalidStateError: FileReader is busy reading.");
+    }
+    this.readyState = 1; // LOADING
+    this.result = null;
+    this.error = null;
+    this._dispatch("loadstart");
+    
+    process.nextTick(async () => {
+      try {
+        const NativeBlob = globalThis.Blob || require("node:buffer").Blob;
+        if (!(blob instanceof NativeBlob)) {
+          throw new TypeError("Argument 1 of FileReader.readAs... is not an instance of Blob.");
+        }
+        const buf = Buffer.from(await blob.arrayBuffer());
+        if (format === "dataURL") {
+          this.result = `data:${blob.type || "application/octet-stream"};base64,${buf.toString("base64")}`;
+        } else if (format === "text") {
+          this.result = buf.toString("utf8");
+        } else if (format === "arrayBuffer") {
+          this.result = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+        } else if (format === "binaryString") {
+          this.result = buf.toString("binary");
+        }
+        this.readyState = 2; // DONE
+        this._dispatch("load");
+        this._dispatch("loadend");
+      } catch (err) {
+        this.readyState = 2; // DONE
+        this.error = err;
+        this._dispatch("error");
+        this._dispatch("loadend");
+      }
+    });
+  }
+
+  readAsArrayBuffer(blob) {
+    this._read(blob, "arrayBuffer");
+  }
+
+  readAsBinaryString(blob) {
+    this._read(blob, "binaryString");
+  }
+
+  readAsDataURL(blob) {
+    this._read(blob, "dataURL");
+  }
+
+  readAsText(blob, encoding = "utf-8") {
+    this._read(blob, "text");
+  }
+
+  abort() {
+    if (this.readyState === 1) {
+      this.readyState = 2;
+      this.result = null;
+      this.error = new Error("AbortError");
+      this._dispatch("abort");
+      this._dispatch("loadend");
+    }
+  }
+}
+
+class WebSocket extends EventTarget {
+  constructor(url, protocols) {
+    super();
+    this.url = url;
+    this.protocols = protocols;
+    this.readyState = 0; // CONNECTING
+    this.extensions = "";
+    this.protocol = "";
+    this.binaryType = "blob";
+    this.bufferedAmount = 0;
+    
+    process.nextTick(() => {
+      this.readyState = 1; // OPEN
+      const openEvent = new Event("open");
+      if (typeof this.onopen === "function") this.onopen(openEvent);
+      this.dispatchEvent(openEvent);
+    });
+  }
+
+  send(data) {
+    if (this.readyState !== 1) {
+      throw new Error("InvalidStateError: WebSocket is not in OPEN state.");
+    }
+  }
+
+  close(code, reason) {
+    if (this.readyState === 2 || this.readyState === 3) return;
+    this.readyState = 2; // CLOSING
+    process.nextTick(() => {
+      this.readyState = 3; // CLOSED
+      const closeEvent = new Event("close");
+      Object.assign(closeEvent, { code: code || 1000, reason: reason || "", wasClean: true });
+      if (typeof this.onclose === "function") this.onclose(closeEvent);
+      this.dispatchEvent(closeEvent);
+    });
+  }
+}
+
 class Element extends Node {
   get tagName() {
     const tag = this._rustDoc.getTagName(this._nodeId);
@@ -1119,6 +1359,7 @@ class Element extends Node {
     if (this.tagName === "TEMPLATE") {
       this.content.innerHTML = val;
     } else {
+      const removedNodes = Array.from(this.childNodes);
       this._rustDoc.setInnerHtml(this._nodeId, String(val));
       if (this._window && this._window.customElements) {
         this._window.customElements.upgrade(this);
@@ -1127,6 +1368,8 @@ class Element extends Node {
         const scripts = this.querySelectorAll("script");
         scripts.forEach(s => runScriptIfNecessary(s, this._window));
       }
+      const addedNodes = Array.from(this.childNodes);
+      notifyMutation(new MutationRecord("childList", this, addedNodes, removedNodes));
     }
   }
 
@@ -1246,6 +1489,7 @@ class Element extends Node {
         }
       }
     }
+    notifyMutation(new MutationRecord("attributes", this, [], [], name, oldVal));
   }
 
   removeAttribute(name) {
@@ -1267,6 +1511,7 @@ class Element extends Node {
         }
       }
     }
+    notifyMutation(new MutationRecord("attributes", this, [], [], name, oldVal));
   }
 
   querySelector(selector) {
@@ -1449,57 +1694,7 @@ function createCanvasContext2D(canvasElement) {
   return createMockCanvasContext2D(canvasElement);
 }
 
-class HTMLCanvasElement extends Element {
-  get width() {
-    const val = this.getAttribute("width");
-    return val !== null ? (parseInt(val, 10) || 300) : 300;
-  }
 
-  set width(val) {
-    const num = parseInt(val, 10) || 300;
-    this.setAttribute("width", String(num));
-    if (this._canvasBackend) {
-      this._canvasBackend.width = num;
-    }
-  }
-
-  get height() {
-    const val = this.getAttribute("height");
-    return val !== null ? (parseInt(val, 10) || 150) : 150;
-  }
-
-  set height(val) {
-    const num = parseInt(val, 10) || 150;
-    this.setAttribute("height", String(num));
-    if (this._canvasBackend) {
-      this._canvasBackend.height = num;
-    }
-  }
-
-  getContext(contextId, options) {
-    if (contextId === "2d") {
-      if (!this._canvasContext) {
-        this._canvasContext = createCanvasContext2D(this);
-      }
-      return this._canvasContext;
-    }
-    return null;
-  }
-
-  toDataURL(type, encoderOptions) {
-    if (this._canvasBackend && typeof this._canvasBackend.toDataURL === "function") {
-      return this._canvasBackend.toDataURL(type, encoderOptions);
-    }
-    return "data:image/png;base64,";
-  }
-
-  toBuffer(type, encoderOptions) {
-    if (this._canvasBackend && typeof this._canvasBackend.toBuffer === "function") {
-      return this._canvasBackend.toBuffer(type, encoderOptions);
-    }
-    return Buffer.alloc(0);
-  }
-}
 
 
 class CustomElementRegistry {
@@ -1616,7 +1811,11 @@ class CustomElementRegistry {
 }
 
 class HTMLElement extends Element {
-  constructor() {
+  constructor(rustDoc, nodeId, window) {
+    if (rustDoc !== undefined) {
+      super(rustDoc, nodeId, window);
+      return;
+    }
     super();
     const upgradeElement = HTMLElement._constructionStack[HTMLElement._constructionStack.length - 1];
     if (upgradeElement) {
@@ -1640,13 +1839,89 @@ class HTMLElement extends Element {
       throw new TypeError("Illegal constructor");
     }
     const doc = win.document;
-    const nodeId = doc._rustDoc.createElement(foundTagName);
-    const node = wrapNode(doc._rustDoc, nodeId, win);
+    const constructedNodeId = doc._rustDoc.createElement(foundTagName);
+    const node = wrapNode(doc._rustDoc, constructedNodeId, win);
     Object.setPrototypeOf(node, new.target.prototype);
     return node;
   }
+
+  focus() {
+    if (this._window && this._window.document) {
+      const doc = this._window.document;
+      const oldActive = doc.activeElement;
+      if (oldActive === this) return;
+      doc._activeElement = this;
+      if (oldActive && typeof oldActive.dispatchEvent === 'function') {
+        oldActive.dispatchEvent(new Event("blur", { bubbles: false, cancelable: false }));
+      }
+      this.dispatchEvent(new Event("focus", { bubbles: false, cancelable: false }));
+    }
+  }
+
+  blur() {
+    if (this._window && this._window.document && this._window.document.activeElement === this) {
+      const doc = this._window.document;
+      doc._activeElement = doc.body || doc.documentElement;
+      this.dispatchEvent(new Event("blur", { bubbles: false, cancelable: false }));
+      if (doc._activeElement) {
+        doc._activeElement.dispatchEvent(new Event("focus", { bubbles: false, cancelable: false }));
+      }
+    }
+  }
 }
 HTMLElement._constructionStack = [];
+
+class HTMLCanvasElement extends HTMLElement {
+  get width() {
+    const val = this.getAttribute("width");
+    return val !== null ? (parseInt(val, 10) || 300) : 300;
+  }
+
+  set width(val) {
+    const num = parseInt(val, 10) || 300;
+    this.setAttribute("width", String(num));
+    if (this._canvasBackend) {
+      this._canvasBackend.width = num;
+    }
+  }
+
+  get height() {
+    const val = this.getAttribute("height");
+    return val !== null ? (parseInt(val, 10) || 150) : 150;
+  }
+
+  set height(val) {
+    const num = parseInt(val, 10) || 150;
+    this.setAttribute("height", String(num));
+    if (this._canvasBackend) {
+      this._canvasBackend.height = num;
+    }
+  }
+
+  getContext(contextId, options) {
+    if (contextId === "2d") {
+      if (!this._canvasContext) {
+        this._canvasContext = createCanvasContext2D(this);
+      }
+      return this._canvasContext;
+    }
+    return null;
+  }
+
+  toDataURL(type, encoderOptions) {
+    if (this._canvasBackend && typeof this._canvasBackend.toDataURL === "function") {
+      return this._canvasBackend.toDataURL(type, encoderOptions);
+    }
+    return "data:image/png;base64,";
+  }
+
+  toBuffer(type, encoderOptions) {
+    if (this._canvasBackend && typeof this._canvasBackend.toBuffer === "function") {
+      return this._canvasBackend.toBuffer(type, encoderOptions);
+    }
+    return Buffer.alloc(0);
+  }
+}
 
 class Document extends Node {
   constructor(rustDoc, nodeId, window) {
@@ -1703,6 +1978,13 @@ class Document extends Node {
 
   get doctype() {
     return null;
+  }
+
+  get activeElement() {
+    if (!this._activeElement) {
+      this._activeElement = this.body || this.documentElement;
+    }
+    return this._activeElement;
   }
 
   get body() {
@@ -1831,16 +2113,88 @@ class Window extends EventTarget {
     this._hidden = !this._pretendToBeVisual;
     this._visibilityState = this._pretendToBeVisual ? "visible" : "prerender";
     
-    if (this._pretendToBeVisual) {
-      this.requestAnimationFrame = (cb) => {
-        return setTimeout(() => {
-          try { cb(Date.now()); } catch(e) { reportException(this, e, this.location.href); }
-        }, 16);
+    this.requestAnimationFrame = (cb) => {
+      return setTimeout(() => {
+        try { cb(Date.now()); } catch(e) { reportException(this, e, this.location.href); }
+      }, 16);
+    };
+    this.cancelAnimationFrame = (id) => {
+      clearTimeout(id);
+    };
+    
+    // Add typical screen properties
+    this.screen = {
+      width: 1920,
+      height: 1080,
+      availWidth: 1920,
+      availHeight: 1040,
+      colorDepth: 24,
+      pixelDepth: 24
+    };
+    
+    // Add performance object
+    const start = Date.now();
+    const hrstart = process.hrtime();
+    this.performance = {
+      now() {
+        const hrtime = process.hrtime(hrstart);
+        return (hrtime[0] * 1000) + (hrtime[1] / 1000000);
+      },
+      timeOrigin: start,
+      timing: {
+        navigationStart: start,
+        domLoading: start,
+        domInteractive: start,
+        domContentLoadedEventStart: start,
+        domContentLoadedEventEnd: start,
+        domComplete: start,
+        loadEventStart: start,
+        loadEventEnd: start
+      },
+      navigation: {
+        type: 0,
+        redirectCount: 0
+      },
+      mark() {},
+      measure() {},
+      clearMarks() {},
+      clearMeasures() {},
+      getEntries() { return []; },
+      getEntriesByName() { return []; },
+      getEntriesByType() { return []; }
+    };
+    
+    // Add matchMedia mock
+    this.matchMedia = (media) => {
+      return {
+        matches: false,
+        media: String(media),
+        onchange: null,
+        addListener() {},
+        removeListener() {},
+        addEventListener() {},
+        removeEventListener() {},
+        dispatchEvent() { return true; }
       };
-      this.cancelAnimationFrame = (id) => {
-        clearTimeout(id);
-      };
-    }
+    };
+    
+    // Add basic alert, confirm, prompt, scroll stubs
+    this.alert = (msg) => {
+      this._virtualConsole.sendTo("log", [msg]);
+    };
+    this.confirm = (msg) => {
+      return true;
+    };
+    this.prompt = (msg, def) => {
+      return def !== undefined ? def : "";
+    };
+    this.scroll = () => {};
+    this.scrollTo = () => {};
+    this.scrollBy = () => {};
+    this.scrollX = 0;
+    this.scrollY = 0;
+    this.pageXOffset = 0;
+    this.pageYOffset = 0;
     
     const quota = options.storageQuota !== undefined ? Number(options.storageQuota) : 5000000;
     this.localStorage = new Storage(quota);
@@ -1868,9 +2222,26 @@ class Window extends EventTarget {
     this.CSSStyleSheet = CSSStyleSheet;
     this.ShadowRoot = ShadowRoot;
     this.CustomElementRegistry = CustomElementRegistry;
+    this.HTMLElement = HTMLElement;
+    this.MutationObserver = MutationObserver;
+    this.MutationRecord = MutationRecord;
+    this.FileReader = FileReader;
+    this.WebSocket = WebSocket;
+    this.Storage = Storage;
+    
+    const NativeBlob = globalThis.Blob || require("node:buffer").Blob;
+    const NativeFile = globalThis.File || require("node:buffer").File;
+    
+    this.Blob = NativeBlob;
+    this.File = NativeFile;
+    this.FormData = globalThis.FormData;
+    this.Headers = globalThis.Headers;
+    this.Request = globalThis.Request;
+    this.Response = globalThis.Response;
+    this.fetch = globalThis.fetch ? globalThis.fetch.bind(globalThis) : undefined;
+    this.crypto = globalThis.crypto || require("node:crypto").webcrypto;
     
     // Alias HTML elements for drop-in prototype checks
-    this.HTMLElement = HTMLElement;
     this.HTMLDivElement = HTMLElement;
     this.HTMLAnchorElement = HTMLElement;
     this.HTMLSpanElement = HTMLElement;
@@ -1884,11 +2255,88 @@ class Window extends EventTarget {
     this.HTMLTemplateElement = HTMLElement;
     this.HTMLIFrameElement = HTMLElement;
     
-    this.navigator = { userAgent: options.userAgent || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" };
+    const userAgentStr = options.userAgent || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    this.navigator = {
+      userAgent: userAgentStr,
+      platform: "Linux x86_64",
+      language: "en-US",
+      languages: ["en-US", "en"],
+      hardwareConcurrency: require('node:os').cpus().length || 4,
+      deviceMemory: 8,
+      maxTouchPoints: 0,
+      cookieEnabled: true,
+      onLine: true,
+      pdfViewerEnabled: true,
+      javaEnabled() { return false; },
+      mimeTypes: { length: 0 },
+      plugins: { length: 0 },
+      clipboard: {
+        readText() { return Promise.resolve(""); },
+        writeText() { return Promise.resolve(); }
+      },
+      geolocation: {
+        getCurrentPosition() {},
+        watchPosition() {},
+        clearWatch() {}
+      }
+    };
+    
+    const windowInstance = this;
+    const historyStateList = [];
+    let historyIndex = -1;
     this.history = {
-      state: null,
-      pushState(state, title, url) {},
-      replaceState(state, title, url) {}
+      get length() {
+        return historyStateList.length;
+      },
+      get state() {
+        return historyIndex >= 0 ? historyStateList[historyIndex].state : null;
+      },
+      go(delta) {
+        const newIndex = historyIndex + delta;
+        if (newIndex >= 0 && newIndex < historyStateList.length) {
+          historyIndex = newIndex;
+          const entry = historyStateList[historyIndex];
+          windowInstance.location.href = entry.url;
+          const popEvent = new Event("popstate");
+          Object.defineProperty(popEvent, "state", { value: entry.state, enumerable: true });
+          windowInstance.dispatchEvent(popEvent);
+        }
+      },
+      back() {
+        this.go(-1);
+      },
+      forward() {
+        this.go(1);
+      },
+      pushState(state, title, url) {
+        if (historyIndex < historyStateList.length - 1) {
+          historyStateList.splice(historyIndex + 1);
+        }
+        let resolvedUrl = windowInstance.location.href;
+        if (url) {
+          try {
+            resolvedUrl = new URL(url, windowInstance.location.href).href;
+          } catch(e) {}
+        }
+        historyStateList.push({ state, title, url: resolvedUrl });
+        historyIndex = historyStateList.length - 1;
+        updateLocation(resolvedUrl);
+      },
+      replaceState(state, title, url) {
+        let resolvedUrl = windowInstance.location.href;
+        if (url) {
+          try {
+            resolvedUrl = new URL(url, windowInstance.location.href).href;
+          } catch(e) {}
+        }
+        if (historyIndex >= 0) {
+          historyStateList[historyIndex] = { state, title, url: resolvedUrl };
+        } else {
+          historyStateList.push({ state, title, url: resolvedUrl });
+          historyIndex = 0;
+        }
+        updateLocation(resolvedUrl);
+      }
     };
     
     this.getComputedStyle = this.getComputedStyle.bind(this);
@@ -1924,10 +2372,26 @@ class Window extends EventTarget {
       pathname: "blank",
       search: "",
       hash: "",
+      origin: "null",
       assign() {},
       replace() {},
       reload() {}
     };
+    
+    function updateLocation(newUrlStr) {
+      try {
+        const u = new URL(newUrlStr, locationObj._href);
+        locationObj._href = u.href;
+        locationObj.protocol = u.protocol;
+        locationObj.host = u.host;
+        locationObj.hostname = u.hostname;
+        locationObj.port = u.port;
+        locationObj.pathname = u.pathname;
+        locationObj.search = u.search;
+        locationObj.hash = u.hash;
+        locationObj.origin = u.origin;
+      } catch (e) {}
+    }
     
     try {
       const u = new URL(url);
@@ -1939,9 +2403,9 @@ class Window extends EventTarget {
       locationObj.pathname = u.pathname;
       locationObj.search = u.search;
       locationObj.hash = u.hash;
+      locationObj.origin = u.origin;
     } catch (e) {}
     
-    const windowInstance = this;
     this.location = Object.create(null);
     Object.defineProperties(this.location, {
       href: {
@@ -1960,6 +2424,7 @@ class Window extends EventTarget {
             locationObj.pathname = u.pathname;
             locationObj.search = u.search;
             locationObj.hash = u.hash;
+            locationObj.origin = u.origin;
             
             const newUrl = u.href;
             const oldBase = oldUrl.split('#')[0];
@@ -2000,6 +2465,13 @@ class Window extends EventTarget {
         },
         enumerable: true,
         configurable: true
+      },
+      origin: {
+        get() {
+          return locationObj.origin || "null";
+        },
+        enumerable: true,
+        configurable: true
       }
     });
     
@@ -2035,6 +2507,19 @@ class Window extends EventTarget {
     activeWindows.delete(this);
     this._nodeCache.clear();
   }
+
+  postMessage(message, targetOrigin, transfer) {
+    process.nextTick(() => {
+      const event = new Event("message");
+      Object.defineProperty(event, "data", { value: message, enumerable: true });
+      Object.defineProperty(event, "origin", { value: this.location.origin || "null", enumerable: true });
+      Object.defineProperty(event, "source", { value: this, enumerable: true });
+      this.dispatchEvent(event);
+    });
+  }
+
+  focus() {}
+  blur() {}
 
   getComputedStyle(element) {
     if (!(element instanceof Element)) {
@@ -2412,5 +2897,9 @@ module.exports = {
   CSSStyleSheet,
   ShadowRoot,
   CustomElementRegistry,
-  HTMLElement
+  HTMLElement,
+  MutationObserver,
+  MutationRecord,
+  FileReader,
+  WebSocket
 };
