@@ -545,6 +545,13 @@ class EventTarget {
       }
     }
     
+    if (path.length > 0) {
+      const last = path[path.length - 1];
+      if (last.nodeType === 9 && last._window) {
+        path.push(last._window);
+      }
+    }
+    
     event._composedPath = path;
     
     // Capturing phase
