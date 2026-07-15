@@ -1,0 +1,24 @@
+{
+  "name": "jsdom-rs",
+  "version": "1.0.0",
+  "description": "JSDOM Rust rewrite",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "jsdom_rs",
+    "targets": [
+      "x86_64-unknown-linux-gnu"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node test.js"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0-alpha.1 || ^2.18.0"
+  },
+  "dependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

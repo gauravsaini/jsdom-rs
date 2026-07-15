@@ -1,0 +1,16 @@
+[package]
+name = "jsdom_rs"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2.16.8", features = ["napi4"] }
+napi-derive = "2.16.8"
+scraper = "0.19.0"
+ego-tree = "0.6.3"
+
+[build-dependencies]
+napi-build = "2.1.3"

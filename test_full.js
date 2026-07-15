@@ -1,0 +1,251 @@
+const { JSDOM, Event, CustomEvent } = require('./index.js');
+const assert = require('assert');
+
+console.log("=== RUNNING JSDOM RUST FULL DROPIN SPECIFICATION SUITE ===");
+
+function test(name, fn) {
+  try {
+    fn();
+    console.log(`✅ [PASS] ${name}`);
+  } catch (err) {
+    console.error(`❌ [FAIL] ${name}`);
+    console.error(err);
+    process.exit(1);
+  }
+}
+
+const dom = new JSDOM(`
+  <!DOCTYPE html>
+  <html>
+    <head>
+      <title>Full Spec Test</title>
+    </head>
+    <body>
+      <div id="container" class="wrapper main">
+        <h1 class="title">My Title</h1>
+        <p class="desc" data-role="intro">Intro text</p>
+        <ul id="list">
+          <li class="item" id="item-1">First Item</li>
+          <!-- middle comment -->
+          <li class="item" id="item-2">Second Item</li>
+          <li class="item" id="item-3">Third Item</li>
+        </ul>
+        <div class="empty-div"></div>
+        <span class="suffix-text">End span</span>
+      </div>
+    </body>
+  </html>
+`);
+
+const { window } = dom;
+const { document } = window;
+
+// 1. Sibling and Traversal APIs
+test("Sibling & Traversal Navigation", () => {
+  const container = document.getElementById("container");
+  
+  assert.strictEqual(container.children.length, 5);
+  assert.strictEqual(container.children[0].tagName, "H1");
+  assert.strictEqual(container.children[4].tagName, "SPAN");
+  
+  assert.strictEqual(container.firstElementChild.tagName, "H1");
+  assert.strictEqual(container.lastElementChild.tagName, "SPAN");
+  
+  const h1 = container.firstElementChild;
+  const p = h1.nextElementSibling;
+  assert.strictEqual(p.tagName, "P");
+  assert.strictEqual(p.previousElementSibling, h1);
+  
+  assert.strictEqual(container.children.item(1).tagName, "P");
+  
+  const list = document.getElementById("list");
+  const firstLi = list.children[0];
+  
+  const sib = firstLi.nextSibling;
+  assert.ok(sib);
+  assert.strictEqual(sib.parentNode, list);
+});
+
+// 2. Node Info & Values
+test("Node Types and Values", () => {
+  const list = document.getElementById("list");
+  
+  const commentNode = list.childNodes.find(n => n.nodeType === 8);
+  assert.ok(commentNode, "Should find a comment node");
+  assert.strictEqual(commentNode.nodeName, "#comment");
+  assert.strictEqual(commentNode.nodeValue.trim(), "middle comment");
+  
+  commentNode.nodeValue = " updated comment ";
+  assert.strictEqual(commentNode.nodeValue, " updated comment ");
+  
+  const h1 = document.querySelector("h1");
+  const textNode = h1.firstChild;
+  assert.strictEqual(textNode.nodeType, 3);
+  assert.strictEqual(textNode.nodeName, "#text");
+  assert.strictEqual(textNode.nodeValue, "My Title");
+  
+  textNode.nodeValue = "New Title Value";
+  assert.strictEqual(h1.textContent, "New Title Value");
+});
+
+// 3. Sibling Mutations
+test("Sibling Mutations (insertBefore, replaceChild)", () => {
+  const list = document.getElementById("list");
+  const refLi = document.getElementById("item-2");
+  
+  const insertedLi = document.createElement("li");
+  insertedLi.className = "item";
+  insertedLi.id = "item-inserted";
+  insertedLi.textContent = "Inserted Item";
+  
+  list.insertBefore(insertedLi, refLi);
+  
+  const items = list.getElementsByClassName("item");
+  assert.strictEqual(items.length, 4);
+  assert.strictEqual(items[1].id, "item-inserted");
+  assert.strictEqual(items[2].id, "item-2");
+  
+  const replacementLi = document.createElement("li");
+  replacementLi.className = "item";
+  replacementLi.id = "item-replaced";
+  replacementLi.textContent = "Replaced Item";
+  
+  list.replaceChild(replacementLi, insertedLi);
+  assert.strictEqual(list.getElementsByClassName("item")[1].id, "item-replaced");
+});
+
+// 4. Node Cloning
+test("Node Cloning (cloneNode deep vs shallow)", () => {
+  const container = document.getElementById("container");
+  
+  const shallow = container.cloneNode(false);
+  assert.strictEqual(shallow.tagName, "DIV");
+  assert.strictEqual(shallow.className, "wrapper main");
+  assert.strictEqual(shallow.children.length, 0, "Shallow clone should have no children");
+  
+  const deep = container.cloneNode(true);
+  assert.strictEqual(deep.tagName, "DIV");
+  assert.strictEqual(deep.children.length, 5, "Deep clone should copy children");
+  assert.strictEqual(deep.firstElementChild.textContent, "New Title Value");
+});
+
+// 5. Fast Path Lookups
+test("Fast Path API Lookups", () => {
+  const container = document.getElementById("container");
+  assert.ok(container);
+  assert.strictEqual(container.tagName, "DIV");
+  
+  const wrapperItems = document.getElementsByClassName("wrapper");
+  assert.strictEqual(wrapperItems.length, 1);
+  assert.strictEqual(wrapperItems[0].id, "container");
+  
+  const lis = document.getElementsByTagName("li");
+  assert.strictEqual(lis.length, 4);
+});
+
+// 6. Events Bubbling and Capturing
+test("Event Bubbling & Capturing", () => {
+  const container = document.getElementById("container");
+  const list = document.getElementById("list");
+  const item1 = document.getElementById("item-1");
+  
+  const eventLog = [];
+  
+  container.addEventListener("click", (e) => {
+    eventLog.push(`container-capture`);
+  }, { capture: true });
+  
+  container.addEventListener("click", (e) => {
+    eventLog.push(`container-bubble`);
+  });
+  
+  list.addEventListener("click", (e) => {
+    eventLog.push(`list-bubble`);
+  });
+  
+  item1.addEventListener("click", (e) => {
+    eventLog.push(`item1-target`);
+  });
+  
+  const clickEvent = new Event("click", { bubbles: true });
+  item1.dispatchEvent(clickEvent);
+  
+  assert.deepStrictEqual(eventLog, [
+    "container-capture",
+    "item1-target",
+    "list-bubble",
+    "container-bubble"
+  ]);
+  
+  const eventLog2 = [];
+  const clickEvent2 = new Event("click", { bubbles: true });
+  
+  const stopper = (e) => {
+    eventLog2.push("list-stopper");
+    e.stopPropagation();
+  };
+  list.addEventListener("click", stopper);
+  
+  item1.dispatchEvent(clickEvent2);
+  assert.deepStrictEqual(eventLog2, [
+    "list-stopper"
+  ]);
+  
+  const cleanLog = [];
+  const target = document.createElement("button");
+  const parent = document.createElement("div");
+  parent.appendChild(target);
+  
+  parent.addEventListener("custom", () => cleanLog.push("parent-bubble"));
+  target.addEventListener("custom", (e) => {
+    cleanLog.push("target");
+    e.stopPropagation();
+  });
+  parent.addEventListener("custom", () => cleanLog.push("parent-capture"), { capture: true });
+  
+  target.dispatchEvent(new Event("custom", { bubbles: true }));
+  assert.deepStrictEqual(cleanLog, ["parent-capture", "target"]);
+});
+
+// 7. Advanced CSS Selectors
+test("Advanced CSS Selectors", () => {
+  const pDirect = document.querySelector("#container > p");
+  assert.ok(pDirect);
+  assert.strictEqual(pDirect.textContent, "Intro text");
+  
+  const liAdjacent = document.querySelector("#item-1 + li");
+  assert.ok(liAdjacent);
+  assert.strictEqual(liAdjacent.id, "item-replaced");
+  
+  const liGeneral = document.querySelectorAll("#item-1 ~ li");
+  assert.strictEqual(liGeneral.length, 3);
+  
+  const firstLi = document.querySelector("#list > li:first-child");
+  assert.ok(firstLi);
+  assert.strictEqual(firstLi.id, "item-1");
+  
+  const lastLi = document.querySelector("#list > li:last-child");
+  assert.ok(lastLi);
+  assert.strictEqual(lastLi.id, "item-3");
+  
+  const emptyDiv = document.querySelector(".empty-div:empty");
+  assert.ok(emptyDiv);
+  
+  const secondLi = document.querySelector("#list > li:nth-child(2)");
+  assert.ok(secondLi);
+  assert.strictEqual(secondLi.id, "item-replaced");
+  
+  const startsWithAttr = document.querySelector("[class^=wrap]");
+  assert.ok(startsWithAttr);
+  assert.strictEqual(startsWithAttr.id, "container");
+  
+  const endsWithAttr = document.querySelector("[class$=main]");
+  assert.ok(endsWithAttr);
+  assert.strictEqual(endsWithAttr.id, "container");
+  
+  const containsAttr = document.querySelector("[class*=wrap]");
+  assert.ok(containsAttr);
+  assert.strictEqual(containsAttr.id, "container");
+});
+
+console.log("\n✨ ALL SPECIFICATION SUITE TESTS PASSED SUCCESSFULLY! ✨");
