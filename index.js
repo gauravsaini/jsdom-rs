@@ -36,6 +36,173 @@ const { RustDocument } = nativeBinding;
 
 const activeWindows = new Set();
 
+const DOMExceptionCodes = {
+  INDEX_SIZE_ERR: 1,
+  DOMSTRING_SIZE_ERR: 2,
+  HIERARCHY_REQUEST_ERR: 3,
+  WRONG_DOCUMENT_ERR: 4,
+  INVALID_CHARACTER_ERR: 5,
+  NO_DATA_ALLOWED_ERR: 6,
+  NO_MODIFICATION_ALLOWED_ERR: 7,
+  NOT_FOUND_ERR: 8,
+  NOT_SUPPORTED_ERR: 9,
+  INUSE_ATTRIBUTE_ERR: 10,
+  INVALID_STATE_ERR: 11,
+  SYNTAX_ERR: 12,
+  INVALID_MODIFICATION_ERR: 13,
+  NAMESPACE_ERR: 14,
+  INVALID_ACCESS_ERR: 15,
+  VALIDATION_ERR: 16,
+  TYPE_MISMATCH_ERR: 17,
+  SECURITY_ERR: 18,
+  NETWORK_ERR: 19,
+  ABORT_ERR: 20,
+  URL_MISMATCH_ERR: 21,
+  QUOTA_EXCEEDED_ERR: 22,
+  TIMEOUT_ERR: 23,
+  INVALID_NODE_TYPE_ERR: 24,
+  DATA_CLONE_ERR: 25
+};
+
+const DOMExceptionNameMap = {
+  IndexSizeError: 1,
+  HierarchyRequestError: 3,
+  WrongDocumentError: 4,
+  InvalidCharacterError: 5,
+  NoModificationAllowedError: 7,
+  NotFoundError: 8,
+  NotSupportedError: 9,
+  InUseAttributeError: 10,
+  InvalidStateError: 11,
+  SyntaxError: 12,
+  InvalidModificationError: 13,
+  NamespaceError: 14,
+  InvalidAccessError: 15,
+  TypeMismatchError: 17,
+  SecurityError: 18,
+  NetworkError: 19,
+  AbortError: 20,
+  URLMismatchError: 21,
+  QuotaExceededError: 22,
+  TimeoutError: 23,
+  InvalidNodeTypeError: 24,
+  DataCloneError: 25
+};
+
+class DOMException extends Error {
+  constructor(message, name = "Error") {
+    super(message);
+    this.name = name;
+    this.code = DOMExceptionNameMap[name] || 0;
+  }
+}
+for (const [key, val] of Object.entries(DOMExceptionCodes)) {
+  DOMException[key] = val;
+  DOMException.prototype[key] = val;
+}
+
+
+
+const recognizedTags = new Set([
+  "html", "head", "body", "title", "meta", "link", "style", "script", "noscript",
+  "div", "span", "p", "a", "img", "button", "input", "select", "option", "textarea", "form",
+  "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "table", "tr", "td", "th", "thead", "tbody", "tfoot",
+  "canvas", "iframe", "nav", "header", "footer", "section", "article", "aside", "main", "search",
+  "details", "summary", "dialog", "audio", "video", "source", "track", "embed", "object", "param", "picture",
+  "map", "area", "br", "hr", "pre", "blockquote", "code", "em", "strong", "small", "sub", "sup", "i", "b", "u", "mark",
+  "ruby", "rt", "rp", "bdi", "bdo", "ins", "del", "caption", "colgroup", "col", "label", "datalist", "optgroup",
+  "output", "progress", "meter", "fieldset", "legend", "template", "slot"
+]);
+
+function escapeHtml(str) {
+  if (typeof str !== "string") return "";
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function serializeNode(node, options = {}) {
+  const type = node.nodeType;
+  if (type === 3) {
+    return escapeHtml(node.nodeValue);
+  }
+  if (type === 8) {
+    return `<!--${node.nodeValue}-->`;
+  }
+  if (type === 9 || type === 11) {
+    let content = "";
+    const children = node.childNodes;
+    for (let i = 0; i < children.length; i++) {
+      content += serializeNode(children[i], options);
+    }
+    return content;
+  }
+  if (type === 1) {
+    const tag = node.tagName.toLowerCase();
+    const voidElements = new Set([
+      "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"
+    ]);
+    const attrs = node.attributes;
+    let attrStr = "";
+    for (let i = 0; i < attrs.length; i++) {
+      const attr = attrs[i];
+      attrStr += ` ${attr.name}="${escapeHtml(attr.value)}"`;
+    }
+    if (voidElements.has(tag)) {
+      return `<${tag}${attrStr}>`;
+    }
+    let content = "";
+    if (node._shadowRoot) {
+      const shadow = node._shadowRoot;
+      let shouldSerializeShadow = false;
+      if (options.serializableShadowRoots && shadow.serializable) {
+        shouldSerializeShadow = true;
+      } else if (options.shadowRoots && options.shadowRoots.includes(shadow)) {
+        shouldSerializeShadow = true;
+      }
+      if (shouldSerializeShadow) {
+        const mode = shadow.mode;
+        const delegatesFocus = shadow.delegatesFocus ? ' shadowrootdelegatesfocus=""' : '';
+        const serializable = shadow.serializable ? ' shadowrootserializable=""' : '';
+        const clonable = shadow.clonable ? ' shadowrootclonable=""' : '';
+        content += `<template shadowrootmode="${mode}"${delegatesFocus}${serializable}${clonable}>`;
+        const shadowChildren = shadow.childNodes;
+        for (let i = 0; i < shadowChildren.length; i++) {
+          content += serializeNode(shadowChildren[i], options);
+        }
+        content += "</template>";
+      }
+    }
+    const children = node.childNodes;
+    for (let i = 0; i < children.length; i++) {
+      content += serializeNode(children[i], options);
+    }
+    return `<${tag}${attrStr}>${content}</${tag}>`;
+  }
+  return "";
+}
+
+function handleDetailsToggle(element, oldOpen, newOpen) {
+  if (element.tagName === "DETAILS" && oldOpen !== newOpen) {
+    const oldState = oldOpen ? "open" : "closed";
+    const newState = newOpen ? "open" : "closed";
+    queueMicrotask(() => {
+      const event = new ToggleEvent("toggle", {
+        bubbles: false,
+        cancelable: false,
+        oldState,
+        newState
+      });
+      element.dispatchEvent(event);
+    });
+  }
+}
+
+
+
 class CookieJar extends toughCookie.CookieJar {
   constructor(store, options) {
     super(store, { looseMode: true, ...options });
@@ -540,6 +707,14 @@ class CustomEvent extends Event {
   }
 }
 
+class ToggleEvent extends Event {
+  constructor(type, eventInitDict = {}) {
+    super(type, eventInitDict);
+    this.oldState = String(eventInitDict.oldState || "");
+    this.newState = String(eventInitDict.newState || "");
+  }
+}
+
 class EventTarget {
   constructor() {
     this._listeners = {};
@@ -642,6 +817,32 @@ class EventTarget {
   }
 }
 
+class OffscreenCanvas extends EventTarget {
+  constructor(width, height) {
+    super();
+    this.width = Number(width) || 0;
+    this.height = Number(height) || 0;
+  }
+  getContext(contextId, options) {
+    if (contextId === "2d") {
+      const mockCanvas = {
+        width: this.width,
+        height: this.height,
+        getAttribute() { return null; },
+        setAttribute() {}
+      };
+      return createCanvasContext2D(mockCanvas);
+    }
+    return null;
+  }
+  transferToImageBitmap() {
+    return {};
+  }
+  toBlob() {
+    return Promise.resolve(new (globalThis.Blob || require("node:buffer").Blob)([]));
+  }
+}
+
 // Lazy NodeList / HTMLCollection Proxy wrapper to eliminate wrap/instantiation overhead on large queryAlls
 class NodeList {
   constructor(rustDoc, ids, window) {
@@ -731,11 +932,15 @@ function wrapNode(rustDoc, nodeId, window) {
   } else {
     const tagName = rustDoc.getTagName(nodeId);
     if (tagName !== null) {
-      const tagUpper = tagName.toUpperCase();
-      if (tagUpper === "CANVAS") {
-        node = new HTMLCanvasElement(rustDoc, nodeId, window);
+      const tagLower = tagName.toLowerCase();
+      if (recognizedTags.has(tagLower) || tagLower.includes("-")) {
+        if (tagLower === "canvas") {
+          node = new HTMLCanvasElement(rustDoc, nodeId, window);
+        } else {
+          node = new HTMLElement(rustDoc, nodeId, window);
+        }
       } else {
-        node = new HTMLElement(rustDoc, nodeId, window);
+        node = new HTMLUnknownElement(rustDoc, nodeId, window);
       }
     } else {
       const val = rustDoc.getNodeValue(nodeId);
@@ -761,6 +966,10 @@ class Node extends EventTarget {
     this._rustDoc = rustDoc;
     this._nodeId = nodeId;
     this._window = window;
+  }
+
+  get [Symbol.toStringTag]() {
+    return this.constructor.name;
   }
 
   get baseURI() {
@@ -1073,10 +1282,22 @@ class ShadowRoot extends DocumentFragment {
     this.host = host;
     this.mode = mode;
     this.adoptedStyleSheets = createAdoptedStyleSheetsArray(this);
+    this.delegatesFocus = false;
+    this.serializable = false;
+    this.clonable = false;
   }
 
   get nodeName() {
     return "#document-fragment";
+  }
+
+  getHTML(options = {}) {
+    let content = "";
+    const children = this.childNodes;
+    for (let i = 0; i < children.length; i++) {
+      content += serializeNode(children[i], options);
+    }
+    return content;
   }
 }
 
@@ -1365,6 +1586,9 @@ class Element extends Node {
     
     const nodeId = this._rustDoc.createDocumentFragment();
     const shadow = new ShadowRoot(this._rustDoc, nodeId, this._window, this, init.mode);
+    shadow.delegatesFocus = !!init.delegatesFocus;
+    shadow.serializable = !!init.serializable;
+    shadow.clonable = !!init.clonable;
     this._shadowRoot = shadow;
     
     if (this._window && this._window._nodeCache) {
@@ -1379,6 +1603,53 @@ class Element extends Node {
       return null;
     }
     return this._shadowRoot;
+  }
+
+  getHTML(options = {}) {
+    let content = "";
+    if (this._shadowRoot) {
+      const shadow = this._shadowRoot;
+      let shouldSerializeShadow = false;
+      if (options.serializableShadowRoots && shadow.serializable) {
+        shouldSerializeShadow = true;
+      } else if (options.shadowRoots && options.shadowRoots.includes(shadow)) {
+        shouldSerializeShadow = true;
+      }
+      if (shouldSerializeShadow) {
+        const mode = shadow.mode;
+        const delegatesFocus = shadow.delegatesFocus ? ' shadowrootdelegatesfocus=""' : '';
+        const serializable = shadow.serializable ? ' shadowrootserializable=""' : '';
+        const clonable = shadow.clonable ? ' shadowrootclonable=""' : '';
+        content += `<template shadowrootmode="${mode}"${delegatesFocus}${serializable}${clonable}>`;
+        const shadowChildren = shadow.childNodes;
+        for (let i = 0; i < shadowChildren.length; i++) {
+          content += serializeNode(shadowChildren[i], options);
+        }
+        content += "</template>";
+      }
+    }
+    const children = this.childNodes;
+    for (let i = 0; i < children.length; i++) {
+      content += serializeNode(children[i], options);
+    }
+    return content;
+  }
+
+  get open() {
+    if (this.tagName === "DETAILS" || this.tagName === "DIALOG") {
+      return this.hasAttribute("open");
+    }
+    return undefined;
+  }
+
+  set open(val) {
+    if (this.tagName === "DETAILS" || this.tagName === "DIALOG") {
+      if (val) {
+        this.setAttribute("open", "");
+      } else {
+        this.removeAttribute("open");
+      }
+    }
   }
 
   get innerHTML() {
@@ -1489,9 +1760,16 @@ class Element extends Node {
   }
 
   setAttribute(name, value) {
+    const isDetailsOrDialog = this.tagName === "DETAILS" || this.tagName === "DIALOG";
+    const oldOpen = isDetailsOrDialog ? this.hasAttribute("open") : false;
+
     const valStr = String(value);
     const oldVal = this.getAttribute(name);
     this._rustDoc.setAttribute(this._nodeId, name, valStr);
+    
+    if (isDetailsOrDialog && name === "open") {
+      handleDetailsToggle(this, oldOpen, true);
+    }
     
     // Check if setting inline event handler
     if (name.startsWith("on")) {
@@ -1523,8 +1801,16 @@ class Element extends Node {
   }
 
   removeAttribute(name) {
+    const isDetailsOrDialog = this.tagName === "DETAILS" || this.tagName === "DIALOG";
+    const oldOpen = isDetailsOrDialog ? this.hasAttribute("open") : false;
+
     const oldVal = this.getAttribute(name);
     this._rustDoc.removeAttribute(this._nodeId, name);
+
+    if (isDetailsOrDialog && name === "open") {
+      handleDetailsToggle(this, oldOpen, false);
+    }
+
     if (name.startsWith("on")) {
       this["on" + name.slice(2)] = null; // triggers setter to clean up
     }
@@ -1901,6 +2187,8 @@ class HTMLElement extends Element {
 }
 HTMLElement._constructionStack = [];
 
+class HTMLUnknownElement extends HTMLElement {}
+
 class HTMLCanvasElement extends HTMLElement {
   get width() {
     const val = this.getAttribute("width");
@@ -2151,6 +2439,25 @@ class Window extends EventTarget {
     this.cancelAnimationFrame = (id) => {
       clearTimeout(id);
     };
+    this.requestIdleCallback = (cb, options) => {
+      const timeout = (options && options.timeout) || 50;
+      return setTimeout(() => {
+        const start = Date.now();
+        try {
+          cb({
+            didTimeout: false,
+            timeRemaining() {
+              return Math.max(0, 50 - (Date.now() - start));
+            }
+          });
+        } catch(e) {
+          reportException(this, e, this.location.href);
+        }
+      }, 1);
+    };
+    this.cancelIdleCallback = (id) => {
+      clearTimeout(id);
+    };
     
     // Add typical screen properties
     this.screen = {
@@ -2258,6 +2565,10 @@ class Window extends EventTarget {
     this.FileReader = FileReader;
     this.WebSocket = WebSocket;
     this.Storage = Storage;
+    this.DOMException = DOMException;
+    this.ToggleEvent = ToggleEvent;
+    this.OffscreenCanvas = OffscreenCanvas;
+    this.HTMLUnknownElement = HTMLUnknownElement;
     
     const NativeBlob = globalThis.Blob || require("node:buffer").Blob;
     const NativeFile = globalThis.File || require("node:buffer").File;

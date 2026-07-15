@@ -1,6 +1,4 @@
-const { Document } = require('./jsdom_rs.node');
-
-console.log("Document loaded successfully:", Document);
+const { JSDOM } = require("./index.js");
 
 const html = `
   <!DOCTYPE html>
@@ -17,22 +15,23 @@ const html = `
 `;
 
 console.time("Parse document");
-const doc = new Document(html);
+const dom = new JSDOM(html);
+const { document } = dom.window;
 console.timeEnd("Parse document");
 
 console.time("Query single selector");
-const title = doc.querySelector(".title");
+const title = document.querySelector(".title");
 console.timeEnd("Query single selector");
 
 console.log("Title tag:", title.tagName);
 console.log("Title content:", title.textContent.trim());
-console.log("Title attributes:", title.attributes);
+console.log("Title class:", title.className);
 
 console.time("Query querySelectorAll");
-const items = doc.querySelectorAll("span.item");
+const items = document.querySelectorAll("span.item");
 console.timeEnd("Query querySelectorAll");
 
 console.log("Found items count:", items.length);
 items.forEach(item => {
-  console.log(`- ${item.tagName}[data-id="${item.attributes['data-id']}"]: "${item.textContent}"`);
+  console.log(`- ${item.tagName}[data-id="${item.getAttribute("data-id")}"]: "${item.textContent}"`);
 });

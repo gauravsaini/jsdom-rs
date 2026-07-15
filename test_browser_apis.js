@@ -132,6 +132,77 @@ async function runTests() {
   });
   await observerCallbackPromise;
 
+  // 12. requestIdleCallback & cancelIdleCallback
+  const idlePromise = new Promise((resolve) => {
+    const handle = window.requestIdleCallback((deadline) => {
+      assert.strictEqual(typeof deadline.timeRemaining, "function");
+      assert.ok(deadline.timeRemaining() <= 50);
+      assert.strictEqual(deadline.didTimeout, false);
+      resolve();
+    });
+    assert.strictEqual(typeof handle, "object"); // setTimeout returns timer object in Node.js
+  });
+  await idlePromise;
+
+  // 13. DOMException and Error.isError
+  try {
+    throw new window.DOMException("Testing index size err", "IndexSizeError");
+  } catch (e) {
+    assert.strictEqual(e.name, "IndexSizeError");
+    assert.strictEqual(e.code, 1);
+    assert.ok(e instanceof window.DOMException);
+    assert.ok(e instanceof window.Error);
+    assert.ok(e instanceof Error);
+    // Node 20+ has util.types.isNativeError / Error.isError
+    assert.ok(require("node:util").types.isNativeError(e) || e instanceof Error);
+  }
+
+  // 14. OffscreenCanvas
+  const offscreen = new window.OffscreenCanvas(200, 300);
+  assert.strictEqual(offscreen.width, 200);
+  assert.strictEqual(offscreen.height, 300);
+  const ctx = offscreen.getContext("2d");
+  assert.ok(ctx !== null);
+  assert.strictEqual(typeof ctx.fillRect, "function");
+
+  // 15. HTMLUnknownElement & Search Tag
+  const searchEl = document.createElement("search");
+  assert.strictEqual(Object.prototype.toString.call(searchEl), "[object HTMLElement]");
+  assert.ok(searchEl instanceof window.HTMLElement);
+  assert.ok(!(searchEl instanceof window.HTMLUnknownElement));
+
+  const unknownEl = document.createElement("customunknown");
+  assert.ok(unknownEl instanceof window.HTMLUnknownElement);
+  assert.strictEqual(Object.prototype.toString.call(unknownEl), "[object HTMLUnknownElement]");
+
+  // 16. getHTML() & attachShadow
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  const shadow = host.attachShadow({ mode: "open", serializable: true });
+  shadow.innerHTML = "<p>shadow content</p>";
+  
+  // Default getHTML() should serialize shadow roots if option is specified
+  const htmlWithShadow = host.getHTML({ serializableShadowRoots: true });
+  assert.ok(htmlWithShadow.includes("shadowrootmode=\"open\""));
+  assert.ok(htmlWithShadow.includes("<p>shadow content</p>"));
+
+  // Default innerHTML should NOT serialize shadow roots
+  assert.strictEqual(host.innerHTML, "");
+
+  // 17. ToggleEvent and <details>
+  const details = document.createElement("details");
+  document.body.appendChild(details);
+  
+  const togglePromise = new Promise((resolve) => {
+    details.addEventListener("toggle", (event) => {
+      assert.strictEqual(event.oldState, "closed");
+      assert.strictEqual(event.newState, "open");
+      resolve();
+    }, { once: true });
+  });
+  details.open = true;
+  await togglePromise;
+
   console.log("✅ ALL BROWSER APIS TESTS PASSED!");
 }
 
