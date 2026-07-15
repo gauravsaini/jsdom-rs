@@ -31,14 +31,58 @@ try {
 
 const { RustDocument } = nativeBinding;
 
+// Find if we are running inside the official jsdom-official repository
+let hostJSDOMPath;
+let parentMod = module;
+while (parentMod) {
+  if (parentMod.filename && parentMod.filename.includes("jsdom-official/lib/api.js")) {
+    hostJSDOMPath = parentMod.filename;
+    break;
+  }
+  parentMod = parentMod.parent;
+}
+
+let OriginalJSDOM;
+let OriginalVirtualConsole;
+let OriginalCookieJar;
+let jsdom;
+
+let realNwsapi;
+let isInternalNwsapiRequire = false;
+
+if (hostJSDOMPath) {
+  const apiOriginalPath = path.join(path.dirname(hostJSDOMPath), "api-original.js");
+  const apiOriginal = require(apiOriginalPath);
+  OriginalJSDOM = apiOriginal.JSDOM;
+  OriginalVirtualConsole = apiOriginal.VirtualConsole;
+  OriginalCookieJar = apiOriginal.CookieJar;
+} else {
+  jsdom = require("jsdom");
+  OriginalJSDOM = jsdom.JSDOM;
+  OriginalVirtualConsole = jsdom.VirtualConsole;
+  OriginalCookieJar = jsdom.CookieJar;
+}
+
 // Lazy-loaded JSDOM internal helpers
 let idlUtils, domSymbolTree, nwsapi, selectorsModule;
 function lazyLoadHelpers() {
   if (!idlUtils) {
-    idlUtils = require("jsdom/lib/jsdom/living/generated/utils");
-    domSymbolTree = require("jsdom/lib/jsdom/living/helpers/internal-constants").domSymbolTree;
-    nwsapi = require("nwsapi");
-    selectorsModule = require("jsdom/lib/jsdom/living/helpers/selectors");
+    if (hostJSDOMPath) {
+      const hostLibDir = path.dirname(hostJSDOMPath);
+      idlUtils = require(path.join(hostLibDir, "generated/idl/utils.js"));
+      domSymbolTree = require(path.join(hostLibDir, "jsdom/living/helpers/internal-constants.js")).domSymbolTree;
+      nwsapi = realNwsapi;
+      selectorsModule = {
+        matchesDontThrow(elImpl, selector) {
+          return mockNwsapi.match(selector, idlUtils.wrapperForImpl(elImpl));
+        }
+      };
+    } else {
+      idlUtils = require("jsdom/lib/jsdom/living/generated/utils");
+      domSymbolTree = require("jsdom/lib/jsdom/living/helpers/internal-constants").domSymbolTree;
+      nwsapi = require("nwsapi");
+      selectorsModule = require("jsdom/lib/jsdom/living/helpers/selectors");
+    }
   }
 }
 
@@ -385,6 +429,23 @@ class ConstructableCSSStyleSheet {
     this.cssRules = [];
   }
 
+  insertRule(rule, index) {
+    const cssom = require("rrweb-cssom");
+    try {
+      const parsed = cssom.parse(rule);
+      const newRule = parsed.cssRules[0];
+      if (index === undefined) index = 0;
+      this.cssRules.splice(index, 0, newRule);
+      return index;
+    } catch (e) {
+      throw new Error("SyntaxError");
+    }
+  }
+
+  deleteRule(index) {
+    this.cssRules.splice(index, 1);
+  }
+
   replace(text) {
     return Promise.resolve().then(() => {
       this.replaceSync(text);
@@ -480,6 +541,27 @@ function getHTMLPatched(options = {}) {
 // Monkeypatch require cache dynamically as modules are loaded
 const originalRequire = Module.prototype.require;
 Module.prototype.require = function(id) {
+  if (id === "nwsapi" || id === "@asamuzakjp/nwsapi") {
+    if (isInternalNwsapiRequire) {
+      return originalRequire.apply(this, arguments);
+    }
+    if (!realNwsapi) {
+      isInternalNwsapiRequire = true;
+      try {
+        realNwsapi = originalRequire.call(this, id);
+      } catch (e) {
+        try {
+          realNwsapi = originalRequire.call(this, id === "nwsapi" ? "@asamuzakjp/nwsapi" : "nwsapi");
+        } catch (err) {}
+      } finally {
+        isInternalNwsapiRequire = false;
+      }
+    }
+    return function(options) {
+      return mockNwsapi;
+    };
+  }
+
   const exports = originalRequire.apply(this, arguments);
   
   if (id.includes("selectors")) {
@@ -651,9 +733,7 @@ Module.prototype.require = function(id) {
   return exports;
 };
 
-// Now import the main JSDOM package
-const jsdom = require("jsdom");
-const OriginalJSDOM = jsdom.JSDOM;
+// JSDOM has been resolved at the top of the file
 
 // Shims for browser features
 const dummyDom = new OriginalJSDOM("<!DOCTYPE html>");
@@ -1051,7 +1131,42 @@ class JSDOM extends OriginalJSDOM {
       Object.setPrototypeOf(window.ToggleEvent.prototype, window.Event.prototype);
 
       // Inject constructable CSSStyleSheet
-      window.CSSStyleSheet = ConstructableCSSStyleSheet;
+      if (window.CSSStyleSheet && window.CSSStyleSheet.prototype) {
+        if (!window.CSSStyleSheet.prototype.replace) {
+          Object.defineProperty(window.CSSStyleSheet.prototype, "replace", {
+            value: function(text) {
+              return Promise.resolve().then(() => {
+                this.replaceSync(text);
+                return this;
+              });
+            },
+            writable: true,
+            configurable: true
+          });
+        }
+        if (!window.CSSStyleSheet.prototype.replaceSync) {
+          Object.defineProperty(window.CSSStyleSheet.prototype, "replaceSync", {
+            value: function(text) {
+              const cssom = require("rrweb-cssom");
+              try {
+                while (this.cssRules.length > 0) {
+                  this.deleteRule(0);
+                }
+                const parsed = cssom.parse(text);
+                if (parsed && parsed.cssRules) {
+                  for (let i = 0; i < parsed.cssRules.length; i++) {
+                    this.insertRule(parsed.cssRules[i].cssText, this.cssRules.length);
+                  }
+                }
+              } catch (e) {}
+            },
+            writable: true,
+            configurable: true
+          });
+        }
+      } else {
+        window.CSSStyleSheet = ConstructableCSSStyleSheet;
+      }
       // VM execution context retrieval target mapping
       window[Symbol.for("unproxied")] = window;
     }
@@ -1060,9 +1175,9 @@ class JSDOM extends OriginalJSDOM {
 
 module.exports = {
   JSDOM,
-  VirtualConsole: jsdom.VirtualConsole,
-  CookieJar: jsdom.CookieJar,
-  ResourceLoader: jsdom.ResourceLoader,
+  VirtualConsole: OriginalVirtualConsole,
+  CookieJar: OriginalCookieJar,
+  ResourceLoader: hostJSDOMPath ? require(path.join(path.dirname(hostJSDOMPath), "api-original.js")).ResourceLoader : jsdom.ResourceLoader,
   Window,
   Document,
   Element,
@@ -1073,7 +1188,7 @@ module.exports = {
   CustomEvent,
   EventTarget,
   DocumentFragment,
-  toughCookie: require("tough-cookie"),
+  toughCookie: hostJSDOMPath ? require(path.join(path.dirname(hostJSDOMPath), "api-original.js")).toughCookie : jsdom.toughCookie,
   CSSStyleSheet: dummyWindow.CSSStyleSheet,
   ShadowRoot,
   CustomElementRegistry: dummyWindow.CustomElementRegistry,
