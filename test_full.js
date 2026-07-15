@@ -308,4 +308,82 @@ test("Canvas context and fallback support", () => {
   assert.ok(data.startsWith("data:image/png;base64"));
 });
 
+// 10. Web Components (Custom Elements, Shadow DOM, adoptedStyleSheets)
+test("Web Components Specs", () => {
+  const container = document.getElementById("container");
+
+  // A. Shadow DOM: attachShadow, mode, host, getRootNode
+  const shadowHost = document.createElement("div");
+  container.appendChild(shadowHost);
+  
+  const shadowRoot = shadowHost.attachShadow({ mode: "open" });
+  assert.strictEqual(shadowRoot.host, shadowHost);
+  assert.strictEqual(shadowRoot.mode, "open");
+  assert.strictEqual(shadowHost.shadowRoot, shadowRoot);
+
+  const innerSpan = document.createElement("span");
+  shadowRoot.appendChild(innerSpan);
+  assert.strictEqual(innerSpan.getRootNode(), shadowRoot);
+  assert.strictEqual(innerSpan.getRootNode({ composed: true }), document);
+
+  // B. Event composedPath across Shadow Boundaries
+  let receivedComposed = false;
+  let receivedComposedPath = [];
+  container.addEventListener("custom-composed", (e) => {
+    receivedComposed = true;
+    receivedComposedPath = e.composedPath();
+  });
+
+  const customEvent = new Event("custom-composed", { bubbles: true, composed: true });
+  innerSpan.dispatchEvent(customEvent);
+  assert.ok(receivedComposed);
+  assert.ok(receivedComposedPath.includes(innerSpan));
+  assert.ok(receivedComposedPath.includes(shadowRoot));
+  assert.ok(receivedComposedPath.includes(shadowHost));
+  assert.ok(receivedComposedPath.includes(container));
+
+  // C. Custom Elements Lifecycle
+  let connectedCalls = 0;
+  let attributeChangedCalls = [];
+  class MyCustomElement extends window.HTMLElement {
+    static get observedAttributes() {
+      return ["data-test"];
+    }
+    connectedCallback() {
+      connectedCalls++;
+    }
+    attributeChangedCallback(name, oldVal, newVal) {
+      attributeChangedCalls.push({ name, oldVal, newVal });
+    }
+  }
+
+  window.customElements.define("my-custom-element", MyCustomElement);
+  
+  const customEl = document.createElement("my-custom-element");
+  assert.strictEqual(customEl.tagName, "MY-CUSTOM-ELEMENT");
+  
+  // Attribute callback should trigger on creation if attribute already present, or on change
+  customEl.setAttribute("data-test", "val1");
+  assert.strictEqual(attributeChangedCalls.length, 1);
+  assert.deepStrictEqual(attributeChangedCalls[0], { name: "data-test", oldVal: null, newVal: "val1" });
+
+  // Connected callback should trigger when appended
+  container.appendChild(customEl);
+  assert.strictEqual(connectedCalls, 1);
+
+  // D. adoptedStyleSheets
+  const sheet = new window.CSSStyleSheet();
+  sheet.replaceSync(".custom-style { color: teal; }");
+  
+  shadowRoot.adoptedStyleSheets = [sheet];
+  
+  const customSpan = document.createElement("span");
+  customSpan.className = "custom-style";
+  shadowRoot.appendChild(customSpan);
+  
+  const computedCustomSpan = window.getComputedStyle(customSpan);
+  assert.strictEqual(computedCustomSpan.color, "teal");
+});
+
 console.log("\n✨ ALL SPECIFICATION SUITE TESTS PASSED SUCCESSFULLY! ✨");
+

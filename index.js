@@ -4,6 +4,8 @@ const vm = require('node:vm');
 const { MIMEType } = require('whatwg-mimetype');
 const toughCookie = require('tough-cookie');
 
+const activeWindows = new Set();
+
 class CookieJar extends toughCookie.CookieJar {
   constructor(store, options) {
     super(store, { looseMode: true, ...options });
@@ -296,9 +298,40 @@ function isAttachedToDocument(node) {
   let curr = node;
   while (curr) {
     if (curr._nodeId === 0) return true;
-    curr = curr.parentNode;
+    if (curr instanceof ShadowRoot) {
+      curr = curr.host;
+    } else {
+      curr = curr.parentNode;
+    }
   }
   return false;
+}
+
+function triggerConnectionLifecycle(node, isConnectedBefore) {
+  if (!node || node._nodeId === 0) return;
+  const isConnectedNow = isAttachedToDocument(node);
+  if (isConnectedNow !== isConnectedBefore) {
+    if (node._customElementState === "upgraded") {
+      if (isConnectedNow) {
+        if (typeof node.connectedCallback === 'function') {
+          try { node.connectedCallback(); } catch(e) { reportException(node._window, e, node._window.location.href); }
+        }
+      } else {
+        if (typeof node.disconnectedCallback === 'function') {
+          try { node.disconnectedCallback(); } catch(e) { reportException(node._window, e, node._window.location.href); }
+        }
+      }
+    }
+    
+    if (node._shadowRoot) {
+      triggerConnectionLifecycle(node._shadowRoot, isConnectedBefore);
+    }
+    
+    const children = node.childNodes;
+    for (let i = 0; i < children.length; i++) {
+      triggerConnectionLifecycle(children[i], isConnectedBefore);
+    }
+  }
 }
 
 function reportException(window, error, filename) {
@@ -439,6 +472,7 @@ class Event {
     this.type = type;
     this.bubbles = !!eventInitDict.bubbles;
     this.cancelable = !!eventInitDict.cancelable;
+    this.composed = !!eventInitDict.composed;
     this.defaultPrevented = false;
     this.target = null;
     this.currentTarget = null;
@@ -446,6 +480,7 @@ class Event {
     this._propagationStopped = false;
     this._immediatePropagationStopped = false;
     this.timeStamp = Date.now();
+    this._composedPath = [];
   }
   
   stopPropagation() {
@@ -461,6 +496,10 @@ class Event {
     if (this.cancelable) {
       this.defaultPrevented = true;
     }
+  }
+
+  composedPath() {
+    return this._composedPath;
   }
 }
 
@@ -496,8 +535,17 @@ class EventTarget {
     let current = this;
     while (current) {
       path.push(current);
-      current = current.parentNode;
+      if (current instanceof ShadowRoot) {
+        if (!event.composed && current !== this) {
+          break;
+        }
+        current = current.host;
+      } else {
+        current = current.parentNode;
+      }
     }
+    
+    event._composedPath = path;
     
     // Capturing phase
     Object.defineProperty(event, 'eventPhase', { value: 1, writable: true, configurable: true });
@@ -760,7 +808,9 @@ class Node extends EventTarget {
   appendChild(child) {
     if (child instanceof Node) {
       if (child.tagName === "STYLE") markStylesDirty(this);
+      const isConnectedBefore = isAttachedToDocument(child);
       this._rustDoc.appendChild(this._nodeId, child._nodeId);
+      triggerConnectionLifecycle(child, isConnectedBefore);
       if (this._window && this._window._runScripts === "dangerously") {
         runScriptIfNecessary(child, this._window);
       }
@@ -772,7 +822,9 @@ class Node extends EventTarget {
   removeChild(child) {
     if (child instanceof Node) {
       if (child.tagName === "STYLE") markStylesDirty(this);
+      const isConnectedBefore = isAttachedToDocument(child);
       this._rustDoc.removeChild(this._nodeId, child._nodeId);
+      triggerConnectionLifecycle(child, isConnectedBefore);
       return child;
     }
     throw new Error("Parameter 1 of Node.removeChild is not of type Node.");
@@ -787,7 +839,9 @@ class Node extends EventTarget {
     }
     if (newChild.tagName === "STYLE") markStylesDirty(this);
     const refId = refChild ? refChild._nodeId : null;
+    const isConnectedBefore = isAttachedToDocument(newChild);
     this._rustDoc.insertBefore(this._nodeId, newChild._nodeId, refId);
+    triggerConnectionLifecycle(newChild, isConnectedBefore);
     if (this._window && this._window._runScripts === "dangerously") {
       runScriptIfNecessary(newChild, this._window);
     }
@@ -802,8 +856,12 @@ class Node extends EventTarget {
       throw new Error("Parameter 2 of Node.replaceChild is not of type Node.");
     }
     if (newChild.tagName === "STYLE" || oldChild.tagName === "STYLE") markStylesDirty(this);
+    const isConnectedNewBefore = isAttachedToDocument(newChild);
+    const isConnectedOldBefore = isAttachedToDocument(oldChild);
     const ret = this._rustDoc.replaceChild(this._nodeId, newChild._nodeId, oldChild._nodeId);
     if (ret !== null) {
+      triggerConnectionLifecycle(newChild, isConnectedNewBefore);
+      triggerConnectionLifecycle(oldChild, isConnectedOldBefore);
       if (this._window && this._window._runScripts === "dangerously") {
         runScriptIfNecessary(newChild, this._window);
       }
@@ -816,6 +874,88 @@ class Node extends EventTarget {
     const clonedId = this._rustDoc.cloneNode(this._nodeId, !!deep);
     return wrapNode(this._rustDoc, clonedId, this._window);
   }
+
+  getRootNode(options = {}) {
+    const composed = !!options.composed;
+    let curr = this;
+    while (curr) {
+      const parent = curr instanceof ShadowRoot ? (composed ? curr.host : null) : curr.parentNode;
+      if (!parent) return curr;
+      curr = parent;
+    }
+    return curr;
+  }
+}
+
+class CSSStyleSheet {
+  constructor(options = {}) {
+    this.media = options.media || "";
+    this.title = options.title || "";
+    this.disabled = !!options.disabled;
+    this._cssText = "";
+    this._rules = [];
+  }
+
+  get cssRules() {
+    return this._rules;
+  }
+
+  replace(cssText) {
+    try {
+      this.replaceSync(cssText);
+      return Promise.resolve(this);
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+
+  replaceSync(cssText) {
+    this._cssText = String(cssText);
+    const parsed = parseCssRules(this._cssText);
+    this._rules = parsed.map((rule, index) => {
+      return {
+        selectorText: rule.selector,
+        style: {
+          cssText: Object.entries(rule.declarations).map(([k, v]) => `${k}: ${v};`).join(" ")
+        },
+        _rule: rule
+      };
+    });
+    
+    if (this._owners) {
+      for (const owner of this._owners) {
+        markStylesDirty(owner);
+      }
+    }
+  }
+}
+
+function createAdoptedStyleSheetsArray(owner) {
+  const arr = [];
+  return new Proxy(arr, {
+    set(target, prop, value, receiver) {
+      const success = Reflect.set(target, prop, value, receiver);
+      if (success) {
+        if (value instanceof CSSStyleSheet) {
+          value._owners = value._owners || new Set();
+          value._owners.add(owner);
+        }
+        markStylesDirty(owner);
+      }
+      return success;
+    },
+    deleteProperty(target, prop) {
+      const value = target[prop];
+      const success = Reflect.deleteProperty(target, prop);
+      if (success) {
+        if (value instanceof CSSStyleSheet && value._owners) {
+          value._owners.delete(owner);
+        }
+        markStylesDirty(owner);
+      }
+      return success;
+    }
+  });
 }
 
 class DocumentFragment extends Node {
@@ -833,6 +973,9 @@ class DocumentFragment extends Node {
 
   set innerHTML(val) {
     this._rustDoc.setInnerHtml(this._nodeId, String(val));
+    if (this._window && this._window.customElements) {
+      this._window.customElements.upgrade(this);
+    }
     if (this._window && this._window._runScripts === "dangerously") {
       const scripts = this.querySelectorAll("script");
       scripts.forEach(s => runScriptIfNecessary(s, this._window));
@@ -847,6 +990,19 @@ class DocumentFragment extends Node {
   querySelectorAll(selector) {
     const ids = this._rustDoc.querySelectorAll(this._nodeId, selector);
     return new NodeList(this._rustDoc, ids, this._window);
+  }
+}
+
+class ShadowRoot extends DocumentFragment {
+  constructor(rustDoc, nodeId, window, host, mode) {
+    super(rustDoc, nodeId, window);
+    this.host = host;
+    this.mode = mode;
+    this.adoptedStyleSheets = createAdoptedStyleSheetsArray(this);
+  }
+
+  get nodeName() {
+    return "#document-fragment";
   }
 }
 
@@ -914,6 +1070,40 @@ class Element extends Node {
     return this._style;
   }
 
+  attachShadow(init) {
+    if (!init || (init.mode !== "open" && init.mode !== "closed")) {
+      throw new TypeError("Failed to execute 'attachShadow' on 'Element': member mode is required and must be 'open' or 'closed'.");
+    }
+    const validTags = [
+      "article", "aside", "blockquote", "body", "div", "footer", "h1", "h2", "h3",
+      "h4", "h5", "h6", "header", "main", "nav", "p", "section", "span"
+    ];
+    const isCustomElement = this.tagName.includes('-');
+    if (!validTags.includes(this.tagName.toLowerCase()) && !isCustomElement) {
+      throw new DOMException(`Failed to execute 'attachShadow' on 'Element': This element does not support attachShadow`, "NotSupportedError");
+    }
+    if (this._shadowRoot !== undefined) {
+      throw new DOMException(`Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.`, "InvalidStateError");
+    }
+    
+    const nodeId = this._rustDoc.createDocumentFragment();
+    const shadow = new ShadowRoot(this._rustDoc, nodeId, this._window, this, init.mode);
+    this._shadowRoot = shadow;
+    
+    if (this._window && this._window._nodeCache) {
+      this._window._nodeCache.set(nodeId, shadow);
+    }
+    
+    return shadow;
+  }
+
+  get shadowRoot() {
+    if (!this._shadowRoot || this._shadowRoot.mode === "closed") {
+      return null;
+    }
+    return this._shadowRoot;
+  }
+
   get innerHTML() {
     return this._rustDoc.getInnerHtml(this._nodeId) || "";
   }
@@ -923,6 +1113,9 @@ class Element extends Node {
       this.content.innerHTML = val;
     } else {
       this._rustDoc.setInnerHtml(this._nodeId, String(val));
+      if (this._window && this._window.customElements) {
+        this._window.customElements.upgrade(this);
+      }
       if (this._window && this._window._runScripts === "dangerously") {
         const scripts = this.querySelectorAll("script");
         scripts.forEach(s => runScriptIfNecessary(s, this._window));
@@ -1017,6 +1210,7 @@ class Element extends Node {
 
   setAttribute(name, value) {
     const valStr = String(value);
+    const oldVal = this.getAttribute(name);
     this._rustDoc.setAttribute(this._nodeId, name, valStr);
     
     // Check if setting inline event handler
@@ -1032,12 +1226,39 @@ class Element extends Node {
         }
       }
     }
+    
+    if (this._customElementState === "upgraded") {
+      const constructor = this.constructor;
+      if (Array.isArray(constructor.observedAttributes) && constructor.observedAttributes.includes(name)) {
+        if (typeof this.attributeChangedCallback === 'function') {
+          try {
+            this.attributeChangedCallback(name, oldVal, valStr);
+          } catch (e) {
+            reportException(this._window, e, this._window.location.href);
+          }
+        }
+      }
+    }
   }
 
   removeAttribute(name) {
+    const oldVal = this.getAttribute(name);
     this._rustDoc.removeAttribute(this._nodeId, name);
     if (name.startsWith("on")) {
       this["on" + name.slice(2)] = null; // triggers setter to clean up
+    }
+    
+    if (this._customElementState === "upgraded") {
+      const constructor = this.constructor;
+      if (Array.isArray(constructor.observedAttributes) && constructor.observedAttributes.includes(name)) {
+        if (typeof this.attributeChangedCallback === 'function') {
+          try {
+            this.attributeChangedCallback(name, oldVal, null);
+          } catch (e) {
+            reportException(this._window, e, this._window.location.href);
+          }
+        }
+      }
     }
   }
 
@@ -1274,7 +1495,158 @@ class HTMLCanvasElement extends Element {
 }
 
 
+class CustomElementRegistry {
+  constructor(window) {
+    this._window = window;
+    this._registry = new Map();
+    this._whenDefinedPromises = new Map();
+    this._whenDefinedResolvers = new Map();
+  }
+
+  define(name, constructor, options = {}) {
+    if (typeof name !== 'string' || !name.includes('-')) {
+      throw new DOMException(`Registration failed for '${name}'. The name is not a valid custom element name.`, 'NotSupportedError');
+    }
+    if (this._registry.has(name)) {
+      throw new DOMException(`Registration failed for '${name}'. A duplicate definition was found.`, 'NotSupportedError');
+    }
+    this._registry.set(name, { constructor, options });
+    
+    if (this._whenDefinedResolvers.has(name)) {
+      this._whenDefinedResolvers.get(name)();
+      this._whenDefinedResolvers.delete(name);
+      this._whenDefinedPromises.delete(name);
+    }
+    
+    this.upgrade(this._window.document);
+  }
+
+  get(name) {
+    const entry = this._registry.get(name);
+    return entry ? entry.constructor : undefined;
+  }
+
+  whenDefined(name) {
+    if (typeof name !== 'string' || !name.includes('-')) {
+      return Promise.reject(new DOMException(`Invalid custom element name: '${name}'`, 'SyntaxError'));
+    }
+    if (this._registry.has(name)) {
+      return Promise.resolve();
+    }
+    if (this._whenDefinedPromises.has(name)) {
+      return this._whenDefinedPromises.get(name);
+    }
+    const promise = new Promise(resolve => {
+      this._whenDefinedResolvers.set(name, resolve);
+    });
+    this._whenDefinedPromises.set(name, promise);
+    return promise;
+  }
+
+  upgrade(root) {
+    const upgradeElement = (element) => {
+      const name = element.localName;
+      if (name) {
+        const definition = this._registry.get(name);
+        if (definition && !element._customElementState) {
+          this._upgradeElementWithDefinition(element, definition);
+        }
+      }
+      
+      if (element.shadowRoot) {
+        upgradeElement(element.shadowRoot);
+      }
+      const children = element.children;
+      if (children) {
+        for (let i = 0; i < children.length; i++) {
+          upgradeElement(children[i]);
+        }
+      }
+    };
+    upgradeElement(root);
+  }
+
+  _upgradeElementWithDefinition(element, definition) {
+    element._customElementState = "upgraded";
+    const constructor = definition.constructor;
+    
+    Object.setPrototypeOf(element, constructor.prototype);
+    
+    try {
+      HTMLElement._constructionStack.push(element);
+      new constructor();
+    } catch (e) {
+      console.error("Custom element construction failed:", e);
+    } finally {
+      HTMLElement._constructionStack.pop();
+    }
+
+    if (isAttachedToDocument(element)) {
+      if (typeof element.connectedCallback === 'function') {
+        try {
+          element.connectedCallback();
+        } catch (e) {
+          reportException(this._window, e, this._window.location.href);
+        }
+      }
+    }
+
+    if (Array.isArray(constructor.observedAttributes)) {
+      const attrs = element.attributes;
+      for (const attr of attrs) {
+        if (constructor.observedAttributes.includes(attr.name)) {
+          if (typeof element.attributeChangedCallback === 'function') {
+            try {
+              element.attributeChangedCallback(attr.name, null, attr.value);
+            } catch (e) {
+              reportException(this._window, e, this._window.location.href);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+class HTMLElement extends Element {
+  constructor() {
+    super();
+    const upgradeElement = HTMLElement._constructionStack[HTMLElement._constructionStack.length - 1];
+    if (upgradeElement) {
+      return upgradeElement;
+    }
+    let foundTagName = null;
+    let win = null;
+    for (const activeWin of activeWindows) {
+      if (activeWin.customElements) {
+        for (const [tag, def] of activeWin.customElements._registry.entries()) {
+          if (def.constructor === new.target) {
+            foundTagName = tag;
+            win = activeWin;
+            break;
+          }
+        }
+      }
+      if (win) break;
+    }
+    if (!foundTagName) {
+      throw new TypeError("Illegal constructor");
+    }
+    const doc = win.document;
+    const nodeId = doc._rustDoc.createElement(foundTagName);
+    const node = wrapNode(doc._rustDoc, nodeId, win);
+    Object.setPrototypeOf(node, new.target.prototype);
+    return node;
+  }
+}
+HTMLElement._constructionStack = [];
+
 class Document extends Node {
+  constructor(rustDoc, nodeId, window) {
+    super(rustDoc, nodeId, window);
+    this.adoptedStyleSheets = createAdoptedStyleSheetsArray(this);
+  }
+
   get documentElement() {
     return this.querySelector('html');
   }
@@ -1297,6 +1669,9 @@ class Document extends Node {
 
   set innerHTML(val) {
     this._rustDoc.setInnerHtml(this._nodeId, String(val));
+    if (this._window && this._window.customElements) {
+      this._window.customElements.upgrade(this);
+    }
     if (this._window && this._window._runScripts === "dangerously") {
       const scripts = this.querySelectorAll("script");
       scripts.forEach(s => runScriptIfNecessary(s, this._window));
@@ -1349,8 +1724,16 @@ class Document extends Node {
   }
 
   createElement(tagName) {
-    const nodeId = this._rustDoc.createElement(tagName.toLowerCase());
-    return wrapNode(this._rustDoc, nodeId, this._window);
+    const tagLower = tagName.toLowerCase();
+    const nodeId = this._rustDoc.createElement(tagLower);
+    const node = wrapNode(this._rustDoc, nodeId, this._window);
+    if (this._window && this._window.customElements) {
+      const def = this._window.customElements._registry.get(tagLower);
+      if (def && !node._customElementState) {
+        this._window.customElements._upgradeElementWithDefinition(node, def);
+      }
+    }
+    return node;
   }
 
   createTextNode(text) {
@@ -1421,6 +1804,7 @@ class Document extends Node {
 class Window extends EventTarget {
   constructor(rustDoc, options = {}, contentType = "text/html", url = "about:blank", referrer = "") {
     super();
+    activeWindows.add(this);
     this._rustDoc = rustDoc;
     this._nodeCache = new Map();
     this.window = this;
@@ -1460,6 +1844,9 @@ class Window extends EventTarget {
     this.document._referrer = referrer;
     this._nodeCache.set(0, this.document);
     
+    // Custom elements registry
+    this.customElements = new CustomElementRegistry(this);
+    
     // Prototypes chain exposure
     this.Window = Window;
     this.Node = Node;
@@ -1471,21 +1858,24 @@ class Window extends EventTarget {
     this.Event = Event;
     this.CustomEvent = CustomEvent;
     this.EventTarget = EventTarget;
+    this.CSSStyleSheet = CSSStyleSheet;
+    this.ShadowRoot = ShadowRoot;
+    this.CustomElementRegistry = CustomElementRegistry;
     
     // Alias HTML elements for drop-in prototype checks
-    this.HTMLElement = Element;
-    this.HTMLDivElement = Element;
-    this.HTMLAnchorElement = Element;
-    this.HTMLSpanElement = Element;
-    this.HTMLInputElement = Element;
-    this.HTMLButtonElement = Element;
-    this.HTMLUListElement = Element;
-    this.HTMLOListElement = Element;
-    this.HTMLLIElement = Element;
-    this.HTMLParagraphElement = Element;
-    this.HTMLImageElement = Element;
-    this.HTMLTemplateElement = Element;
-    this.HTMLIFrameElement = Element;
+    this.HTMLElement = HTMLElement;
+    this.HTMLDivElement = HTMLElement;
+    this.HTMLAnchorElement = HTMLElement;
+    this.HTMLSpanElement = HTMLElement;
+    this.HTMLInputElement = HTMLElement;
+    this.HTMLButtonElement = HTMLElement;
+    this.HTMLUListElement = HTMLElement;
+    this.HTMLOListElement = HTMLElement;
+    this.HTMLLIElement = HTMLElement;
+    this.HTMLParagraphElement = HTMLElement;
+    this.HTMLImageElement = HTMLElement;
+    this.HTMLTemplateElement = HTMLElement;
+    this.HTMLIFrameElement = HTMLElement;
     
     this.navigator = { userAgent: options.userAgent || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" };
     this.history = {
@@ -1634,6 +2024,11 @@ class Window extends EventTarget {
     });
   }
 
+  close() {
+    activeWindows.delete(this);
+    this._nodeCache.clear();
+  }
+
   getComputedStyle(element) {
     if (!(element instanceof Element)) {
       throw new TypeError("parameter 1 is not of type Element.");
@@ -1641,39 +2036,87 @@ class Window extends EventTarget {
     
     const computed = new CSSStyleDeclaration(null, true);
     
+    const roots = [];
+    let curr = element;
+    while (curr) {
+      const root = curr.getRootNode();
+      if (root && !roots.includes(root)) {
+        roots.push(root);
+      }
+      if (curr instanceof ShadowRoot) {
+        curr = curr.host;
+      } else {
+        curr = curr.parentNode;
+      }
+    }
+    
+    const rules = [];
+    
     const doc = element._window ? element._window.document : null;
     if (doc) {
       if (!doc._cachedStylesVersion || doc._cachedStylesVersion !== doc._stylesVersion) {
         const styles = doc.querySelectorAll("style");
-        const rules = [];
+        const docRules = [];
         styles.forEach(styleEl => {
-          const cssText = styleEl.textContent;
-          rules.push(...parseCssRules(cssText));
+          docRules.push(...parseCssRules(styleEl.textContent));
         });
-        
-        rules.forEach((rule, index) => {
+        if (doc.adoptedStyleSheets) {
+          for (const sheet of doc.adoptedStyleSheets) {
+            if (!sheet.disabled) {
+              docRules.push(...sheet.cssRules.map(r => r._rule));
+            }
+          }
+        }
+        docRules.forEach((rule, index) => {
           rule.specificity = getSpecificity(rule.selector);
           rule.index = index;
         });
-        
-        rules.sort((a, b) => {
+        docRules.sort((a, b) => {
           if (a.specificity !== b.specificity) {
             return a.specificity - b.specificity;
           }
           return a.index - b.index;
         });
-        
-        doc._cachedRules = rules;
+        doc._cachedRules = docRules;
         doc._cachedStylesVersion = doc._stylesVersion || 1;
       }
-      
       if (doc._cachedRules) {
-        for (const rule of doc._cachedRules) {
-          if (element.matches(rule.selector)) {
-            for (const [prop, val] of Object.entries(rule.declarations)) {
-              computed._values.set(prop, val);
+        rules.push(...doc._cachedRules);
+      }
+    }
+    
+    for (const root of roots) {
+      if (root instanceof ShadowRoot) {
+        const styles = root.querySelectorAll("style");
+        const srRules = [];
+        styles.forEach(styleEl => {
+          srRules.push(...parseCssRules(styleEl.textContent));
+        });
+        if (root.adoptedStyleSheets) {
+          for (const sheet of root.adoptedStyleSheets) {
+            if (!sheet.disabled) {
+              srRules.push(...sheet.cssRules.map(r => r._rule));
             }
           }
+        }
+        srRules.forEach((rule, index) => {
+          rule.specificity = getSpecificity(rule.selector);
+          rule.index = index;
+        });
+        srRules.sort((a, b) => {
+          if (a.specificity !== b.specificity) {
+            return a.specificity - b.specificity;
+          }
+          return a.index - b.index;
+        });
+        rules.push(...srRules);
+      }
+    }
+    
+    for (const rule of rules) {
+      if (element.matches(rule.selector)) {
+        for (const [prop, val] of Object.entries(rule.declarations)) {
+          computed._values.set(prop, val);
         }
       }
     }
@@ -1958,5 +2401,9 @@ module.exports = {
   DocumentFragment,
   VirtualConsole,
   CookieJar,
-  toughCookie
+  toughCookie,
+  CSSStyleSheet,
+  ShadowRoot,
+  CustomElementRegistry,
+  HTMLElement
 };
